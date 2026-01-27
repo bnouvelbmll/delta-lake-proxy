@@ -17,5 +17,9 @@
       }
     ]
   },
-  "port": 18080
+  "port": 18080,
+  "database": {
+    "uri": "sqlite:delta_proxy.db"
+  },
+  "databaseEnabled": true
 }

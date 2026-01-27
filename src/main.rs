@@ -7,7 +7,7 @@ use futures_util::{Stream, TryStreamExt};
 use moka::sync::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use url::Url;
 use warp::http::{HeaderMap, Uri};
@@ -17,6 +17,11 @@ use warp::{Filter, Reply, http::StatusCode};
 
 mod config;
 use config::*;
+mod database;
+use database::DBPool;
+mod permission;
+mod metrics;
+use metrics::{AppMetrics, metrics_route};
 
 // ---------------------- Custom Error ----------------------
 #[derive(Debug)]
@@ -37,10 +42,12 @@ struct AppState {
     auth_cache: Cache<String, bool>,             // Cache for validated AWS credentials
     file_list_cache: Cache<String, Arc<Vec<String>>>, 
     config: Config,
+    db_pool: Option<DBPool>,
+    metrics: Arc<AppMetrics>, // Add metrics field
 }
 
 impl AppState {
-    async fn new() -> Self {
+    async fn new(metrics: Arc<AppMetrics>) -> Self {
         let aws_config = aws_config::load_from_env().await;
         let s3_client = S3Client::new(&aws_config);
         let http_client = reqwest::Client::new();
@@ -53,6 +60,11 @@ impl AppState {
 
         let config: Config = settings.try_deserialize().unwrap();
 
+        let db_pool = if config.database_enabled {
+            Some(DBPool::new(&config).await.unwrap())
+        } else {
+            None
+        };
 
         let mut table_mapping = HashMap::new();
         for (alias, uri) in &config.table_mapping {
@@ -79,6 +91,8 @@ impl AppState {
                 .time_to_live(Duration::from_secs(120))
                 .build(),
             config,
+            db_pool,
+            metrics,
         }
     }
 }
@@ -91,10 +105,13 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let state = Arc::new(AppState::new().await);
+    let metrics = AppMetrics::new();
+    tokio::spawn(AppMetrics::start_aggregation_task(metrics.clone()));
+
+    let state = Arc::new(AppState::new(metrics.clone()).await);
     let port = state.config.port;
 
-    let list_buckets_route = warp::path::end().and(warp::get()).map(|| {
+    let list_buckets_route = warp::path::end().and(warp::get()).map(move || {
         let mut xml = String::new();
         use std::fmt::Write;
         write!(&mut xml, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>").unwrap();
@@ -144,9 +161,20 @@ async fn main() {
         .and(with_state(state.clone()))
         .and_then(proxy_to_s3);
 
-    let routes = list_buckets_route.or(get_route).or(other_routes).recover(handle_rejection);
+    let routes = list_buckets_route
+        .or(get_route)
+        .or(other_routes)
+        .recover(handle_rejection);
 
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    let main_server = warp::serve(routes).run(([0, 0, 0, 0], port));
+
+    if let Some(metrics_port) = state.config.metrics_port {
+        info!("Starting metrics server on port {}", metrics_port);
+        let metrics_server = warp::serve(metrics_route()).run(([0, 0, 0, 0], metrics_port));
+        tokio::spawn(metrics_server);
+    }
+
+    main_server.await;
 }
 
 // ---------------------- Warp helpers ----------------------
@@ -334,7 +362,7 @@ async fn get_allowed_files_for_table(
     user_id: &Option<String>,
     table_alias: &str,
     table_uri: &str,
-    partition_filters_config: &[HashMap<String, String>],
+    partition_filters_config: &Vec<HashMap<String, String>>,
 ) -> Result<Arc<Vec<String>>, warp::Rejection> {
     let cache_key = format!("{}:{}", user_id.as_deref().unwrap_or("anonymous"), table_alias);
 
@@ -389,9 +417,13 @@ async fn handle_get(
     headers: HeaderMap,
     state: Arc<AppState>,
 ) -> Result<Box<dyn Reply>, warp::Rejection> {
+    state.metrics.inc_queries_served();
     let path_str = path.as_str();
     // Use x-user-id or extract from AWS Authorization header
     let user_id = extract_aws_user(auth_header.as_deref());
+    if let Some(uid) = &user_id {
+        state.metrics.record_user(uid.clone());
+    }
 
     debug!("handle_get: path={}, query={:?}, user={:?}", path_str, query, user_id);
 
@@ -453,7 +485,7 @@ async fn handle_get(
     if file_path.starts_with("_delta_log/") || file_path == "_delta_log" {
         debug!("Proxying _delta_log request directly for {}", table_alias);
         let s3_key = format!("{}/{}", s3_prefix, file_path);
-        return proxy_s3_get(&state.s3_client, bucket, &s3_key, &headers)
+        return proxy_s3_get(&state.s3_client, bucket, &s3_key, &headers, state.metrics.clone())
             .await
             .map(|r| Box::new(r) as Box<dyn Reply>);
     }
@@ -473,26 +505,45 @@ async fn handle_get(
     let table_uri = format!("s3://{}/{}", bucket, s3_prefix);
     let full_s3_path = format!("s3://{}/{}/{}", bucket, s3_prefix, file_path);
 
-    if let Some(partition_filters_config) = state.config.allowed_partitions.get(table_alias) {
-        if !partition_filters_config.is_empty() {
-            let allowed_files = get_allowed_files_for_table(
-                &state,
-                &user_id,
-                table_alias,
-                &table_uri,
-                partition_filters_config,
-            )
-            .await?;
+    let mut combined_partition_filters = state.config.allowed_partitions.get(table_alias)
+        .cloned()
+        .unwrap_or_default();
 
-            if !allowed_files.iter().any(|f| f == &full_s3_path) {
-                warn!("Access denied for user {:?} on file {}", user_id, file_path);
-                return Ok(Box::new(warp::reply::with_status(
-                    "Forbidden by partition policy",
-                    warp::http::StatusCode::FORBIDDEN,
-                )));
+    if state.config.database_enabled {
+        if let Some(ref db_pool) = state.db_pool {
+            if let Some(uid) = &user_id {
+                match db_pool.get_permissions(uid, table_alias).await {
+                    Ok(db_filters) => {
+                        combined_partition_filters.extend(db_filters);
+                    },
+                    Err(e) => {
+                        error!("Failed to get permissions from DB for user {}: {:?}", uid, e);
+                        return Err(custom_rejection("Database permission lookup error"));
+                    }
+                }
             }
-            info!("Access granted for {} based on partition filter", full_s3_path);
         }
+    }
+
+
+    if !combined_partition_filters.is_empty() {
+        let allowed_files = get_allowed_files_for_table(
+            &state,
+            &user_id,
+            table_alias,
+            &table_uri,
+            &combined_partition_filters,
+        )
+        .await?;
+
+        if !allowed_files.iter().any(|f| f == &full_s3_path) {
+            warn!("Access denied for user {:?} on file {}", user_id, file_path);
+            return Ok(Box::new(warp::reply::with_status(
+                "Forbidden by partition policy",
+                warp::http::StatusCode::FORBIDDEN,
+            )));
+        }
+        info!("Access granted for {} based on partition filter", full_s3_path);
     }
 
     // Step 2: Decide whether to proxy or presign based on config
@@ -500,20 +551,19 @@ async fn handle_get(
     match state.config.get_mode {
         GetMode::Proxy => {
             info!("Proxying GET request for {}", full_s3_key);
-            proxy_s3_get(&state.s3_client, bucket, &full_s3_key, &headers)
+            proxy_s3_get(&state.s3_client, bucket, &full_s3_key, &headers, state.metrics.clone())
                 .await
                 .map(|r| Box::new(r) as Box<dyn Reply>)
         }
         GetMode::PresignedUrl => {
             // If Range header is present, still proxy the request for efficiency
             if let Some(range_header) = headers.get("range") {
-                if state.config.proxy_partial {
-                    info!("Proxying Partial GET request for {}", full_s3_key);
-                    return proxy_s3_get(&state.s3_client, bucket, &full_s3_key, &headers)
-                        .await
-                        .map(|r| Box::new(r) as Box<dyn Reply>);
-
-                }
+                                if state.config.proxy_partial {
+                                    info!("Proxying Partial GET request for {}", full_s3_key);
+                                    return proxy_s3_get(&state.s3_client, bucket, &full_s3_key, &headers, state.metrics.clone())
+                                        .await
+                                        .map(|r| Box::new(r) as Box<dyn Reply>);
+                                }
                 else {
                     if let Ok(range_str) = range_header.to_str() {
                         info!("Presigned URL for partial range request for {}", full_s3_key);
@@ -564,7 +614,9 @@ async fn proxy_s3_get(
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    metrics: Arc<AppMetrics>,
 ) -> Result<Response<Body>, warp::Rejection> {
+    let start_time = Instant::now();
     let mut request_builder = s3_client.get_object().bucket(bucket).key(key);
     if let Some(range) = headers.get("range") {
         if let Ok(range_str) = range.to_str() {
@@ -575,6 +627,13 @@ async fn proxy_s3_get(
 
     match output {
         Ok(o) => {
+            let latency = start_time.elapsed();
+            metrics.record_backend_latency(latency);
+
+            if let Some(len) = o.content_length() {
+                metrics.record_message_size(len as usize);
+            }
+
             let mut resp_builder = Response::builder();
 
             // Default to 200 OK, but check for 206 Partial Content
@@ -627,6 +686,7 @@ async fn proxy_s3_forward(
     headers: HeaderMap,
     body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + 'static,
     client: &reqwest::Client,
+    metrics: Arc<AppMetrics>,
 ) -> Result<Box<dyn Reply>, warp::Rejection> {
     // Construct S3 URL (assuming standard AWS S3)
     let url = format!("https://{}.s3.amazonaws.com/{}", bucket, key);
@@ -652,8 +712,21 @@ async fn proxy_s3_forward(
     let body = body.map_ok(|mut buf| buf.copy_to_bytes(buf.remaining()));
     req_builder = req_builder.body(reqwest::Body::wrap_stream(body));
 
+    let start_time = Instant::now();
+
     match req_builder.send().await {
         Ok(resp) => {
+            let latency = start_time.elapsed();
+            metrics.record_backend_latency(latency);
+
+            if let Some(content_length) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+                if let Ok(len_str) = content_length.to_str() {
+                    if let Ok(len) = len_str.parse::<usize>() {
+                        metrics.record_message_size(len);
+                    }
+                }
+            }
+
             let status = resp.status();
             let headers = resp.headers().clone();
             let stream = resp
@@ -691,8 +764,13 @@ async fn proxy_to_s3(
     body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + 'static,
     state: Arc<AppState>,
 ) -> Result<Box<dyn Reply>, warp::Rejection> {
+    state.metrics.inc_queries_proxied(); // Increment proxied queries
     let path_str = path.as_str();
     debug!("proxy_to_s3: method={} path={}", method, path_str);
+    let user_id = extract_aws_user(req_headers.get("authorization").and_then(|h| h.to_str().ok()));
+    if let Some(uid) = user_id {
+        state.metrics.record_user(uid); // Record unique user
+    }
 
     // Enforce Read-Only Mode
     if state.config.read_only
@@ -742,10 +820,10 @@ async fn proxy_to_s3(
         match mode_str.to_lowercase().as_str() {
             "forward" => AuthMode::Forward,
             "iam" => AuthMode::Iam,
-            _ => state.config.default_auth_mode,
+            _ => state.config.auth_mode,
         }
     } else {
-        state.config.default_auth_mode
+        state.config.auth_mode
     };
 
     if auth_mode == AuthMode::Forward {
@@ -756,12 +834,13 @@ async fn proxy_to_s3(
             req_headers,
             body,
             &state.http_client,
+            state.metrics.clone(),
         )
         .await;
     }
 
     match method {
-        Method::GET => proxy_s3_get(s3_client, bucket, &s3_key, &req_headers)
+        Method::GET => proxy_s3_get(s3_client, bucket, &s3_key, &req_headers, state.metrics.clone())
             .await
             .map(|r| Box::new(r) as Box<dyn Reply>),
 
@@ -949,6 +1028,12 @@ mod tests {
             }
         }
 
+        let db_pool = if config.database_enabled {
+            Some(DBPool::new(&config).await.unwrap())
+        } else {
+            None
+        };
+
         AppState {
             s3_client,
             http_client,
@@ -966,6 +1051,7 @@ mod tests {
                 .time_to_live(Duration::from_secs(120))
                 .build(),
             config,
+            db_pool,
         }
     }
 

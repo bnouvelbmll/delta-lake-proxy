@@ -62,9 +62,27 @@ The application is configured via a `config.json` file in the working directory,
 *   `getMode`: The mode for handling `GET` requests. Can be `proxy` or `presignedUrl`. Defaults to `presignedUrl`.
 *   `allowedPartitions`: A map where keys are table aliases and values are lists of allowed partition key-value pairs.
 *   `port`: The port on which the proxy will listen. Defaults to `18080`.
+*   `metricsPort`: An optional port for a separate Prometheus metrics endpoint. If specified, a metrics server will run on this port (e.g., `9090`). If omitted, metrics are not exposed on a separate port. Defaults to `9090`.
 
 Configuration can be set by env variable
 ```export PROXY_PORT=28080 ```  can be a way to change the port.
+
+## Prometheus Metrics
+
+The `delta-s3-proxy` exposes a Prometheus-compatible metrics endpoint to monitor its operational statistics. This endpoint can be configured to run on a separate port.
+
+**Endpoint:** `/metrics`
+
+**Configuration:**
+The `metricsPort` field in `config.json` (or `PROXY_METRICS_PORT` environment variable) determines the port for the metrics server. If `metricsPort` is not specified, a metrics server will not be started on a separate port.
+
+**Collected Metrics (Aggregated per minute):**
+
+*   `queries_served_total`: Counter for the total number of queries served by the proxy.
+*   `queries_proxied_total`: Counter for the total number of queries directly proxied to S3.
+*   `unique_users_last_minute`: Gauge indicating the number of unique user IDs observed in the last minute.
+*   `backend_reply_latency_seconds_avg`: Gauge showing the average latency (in seconds) of backend S3 replies in the last minute.
+*   `average_message_size_bytes`: Gauge representing the average size (in bytes) of messages processed in the last minute.
 
 ## Building
 
@@ -83,7 +101,7 @@ cargo build --release
 Before running, ensure your environment is configured with AWS credentials that have access to the underlying S3 buckets.
 
 ```bash
-./target/release/delta_s3_proxy
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > /tmp/rup.sh; sh /tmp/rup.sh -y; rm /tmp/rup.sh; . "$HOME/.cargo/env"
 ```
 
 The proxy will start on the port specified in the configuration (default `18080`).

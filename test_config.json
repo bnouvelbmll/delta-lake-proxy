@@ -1,13 +1,26 @@
 {
-  "table_mapping": {
-    "table": "s3://test-bucket/uuuid1/dfdf/uuid2"
+  "tableMapping": {
+    "table": "s3://uuuid1/dfdf/uuid2/",
+    "other_table": "s3://some-other-bucket/path/"
   },
   "readOnly": true,
   "proxyPartial": false,
   "defaultAuthMode": "iam",
-  "getMode": "proxy",
-  "policy_cache_size": 100,
-  "delta_cache_size": 20,
-  "auth_cache_size": 100,
-  "port": 18081
+  "allowedPartitions": {
+    "table": [
+      {
+        "year": "2023",
+        "month": "10"
+      },
+      {
+        "year": "2024",
+        "month": "01"
+      }
+    ]
+  },
+  "port": 18080,
+  "database": {
+    "uri": "sqlite::memory:"
+  },
+  "databaseEnabled": true
 }
