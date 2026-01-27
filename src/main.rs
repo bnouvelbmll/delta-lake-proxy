@@ -164,9 +164,12 @@ async fn main() {
     // HEAD route: handle partition-aware HEAD requests
     let head_route = warp::head()
         .and(datalake_prefix.clone())
+        .and(warp::header::optional("authorization"))
         .and(warp::path::tail())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::header::headers_cloned())
         .and(with_state(state.clone()))
-        .and_then(handle_head);
+        .and_then(handle_head_wrapper);
 
     let head_root_route = warp::path::end().and(warp::head()).map(move || {
         debug!("HEAD request for /");
@@ -602,6 +605,15 @@ async fn handle_get(
         }
     }
     
+    async fn handle_head_wrapper(
+        _auth_header: Option<String>,
+        path: warp::path::Tail,
+        _query: HashMap<String, String>,
+        _headers: HeaderMap,
+        state: Arc<AppState>,
+    ) -> Result<Box<dyn Reply>, warp::Rejection> {
+        handle_head(path, state).await
+    }
     
     // ---------------------- Handle HEAD ----------------------
     async fn handle_head(
