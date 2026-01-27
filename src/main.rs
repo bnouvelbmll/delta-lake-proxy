@@ -161,8 +161,16 @@ async fn main() {
         .and(with_state(state.clone()))
         .and_then(proxy_to_s3);
 
+    // HEAD route: handle partition-aware HEAD requests
+    let head_route = warp::head()
+        .and(datalake_prefix.clone())
+        .and(warp::path::tail())
+        .and(with_state(state.clone()))
+        .and_then(handle_head);
+
     let routes = list_buckets_route
         .or(get_route)
+        .or(head_route)
         .or(other_routes)
         .recover(handle_rejection);
 
@@ -582,13 +590,55 @@ async fn handle_get(
                 presigned_url.parse::<Uri>().unwrap(),
             )))
         }
+        }
     }
-}
-
-
-
-
-// ---------------------- Mock: presigned URL ----------------------
+    
+    
+    // ---------------------- Handle HEAD ----------------------
+    async fn handle_head(
+        path: warp::path::Tail,
+        state: Arc<AppState>,
+    ) -> Result<Box<dyn Reply>, warp::Rejection> {
+        state.metrics.inc_queries_served();
+        let path_str = path.as_str();
+    
+        debug!("handle_head: path={}", path_str);
+    
+        if path_str.is_empty() {
+            warn!("HEAD request to root is not supported with current proxy_head implementation.");
+            return Ok(Box::new(warp::reply::with_status(
+                "Method Not Allowed at Root",
+                warp::http::StatusCode::METHOD_NOT_ALLOWED,
+            )));
+        }
+    
+        // Extract table alias and relative file path
+        let (table_alias, file_path) = match path_str.split_once('/') {
+            Some((alias, path)) => (alias, path),
+            None => (path_str, ""),
+        };
+    
+        let (bucket, s3_prefix) = match state.table_mapping.get(table_alias) {
+            Some(val) => val,
+            None => {
+                warn!("Table alias not found for HEAD request: {}", table_alias);
+                return Ok(Box::new(warp::reply::with_status(
+                    "Table not found",
+                    warp::http::StatusCode::NOT_FOUND,
+                )));
+            }
+        };
+    
+        let full_s3_key = format!("{}/{}", s3_prefix, file_path);
+    
+        info!("Proxying HEAD request for {}", full_s3_key);
+        proxy_s3_head(&state.s3_client, bucket, &full_s3_key, state.metrics.clone())
+            .await
+            .map(|r| Box::new(r) as Box<dyn Reply>)
+    }
+    
+    
+    // ---------------------- Mock: presigned URL ----------------------
 async fn generate_presigned_url(client: &S3Client, bucket: &str, key: &str, range_str: Option<&str>) -> String {
     let presigning_config = PresigningConfig::expires_in(Duration::from_secs(300)).unwrap();
     let mut presigned_prereq = client
@@ -671,6 +721,51 @@ async fn proxy_s3_get(
             error!("S3 GET error: {:?}", err);
             Ok(warp::reply::with_status(
                 "S3 GET error",
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response())
+        }
+    }
+}
+
+// ---------------------- Helper: Proxy S3 HEAD ----------------------
+async fn proxy_s3_head(
+    s3_client: &S3Client,
+    bucket: &str,
+    key: &str,
+    metrics: Arc<AppMetrics>,
+) -> Result<Response<Body>, warp::Rejection> {
+    let start_time = Instant::now();
+    let request_builder = s3_client.head_object().bucket(bucket).key(key);
+    let output = request_builder.send().await;
+
+    match output {
+        Ok(o) => {
+            let latency = start_time.elapsed();
+            metrics.record_backend_latency(latency);
+
+            let mut resp_builder = Response::builder();
+
+            if let Some(ct) = o.content_type() {
+                resp_builder = resp_builder.header("content-type", ct);
+            }
+            if let Some(len) = o.content_length() {
+                resp_builder = resp_builder.header("content-length", len.to_string());
+            }
+            if let Some(etag) = o.e_tag() {
+                resp_builder = resp_builder.header("etag", etag);
+            }
+            if let Some(last_modified) = o.last_modified() {
+                resp_builder = resp_builder.header("last-modified", last_modified.fmt(DateTimeFormat::HttpDate).unwrap());
+            }
+
+            // HEAD requests do not have a body
+            Ok(resp_builder.status(200).body(Body::empty()).unwrap())
+        }
+        Err(err) => {
+            error!("S3 HEAD error: {:?}", err);
+            Ok(warp::reply::with_status(
+                "S3 HEAD error",
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             )
             .into_response())
