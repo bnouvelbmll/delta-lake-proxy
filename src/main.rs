@@ -168,11 +168,21 @@ async fn main() {
         .and(with_state(state.clone()))
         .and_then(handle_head);
 
+    let head_root_route = warp::path::end().and(warp::head()).map(move || {
+        debug!("HEAD request for /");
+        warp::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap()
+    });
+
     let routes = list_buckets_route
+        .or(head_root_route)
         .or(get_route)
         .or(head_route)
         .or(other_routes)
-        .recover(handle_rejection);
+        .recover(handle_rejection)
+        .with(warp::trace::request());
 
     let main_server = warp::serve(routes).run(([0, 0, 0, 0], port));
 
@@ -427,7 +437,6 @@ async fn handle_get(
 ) -> Result<Box<dyn Reply>, warp::Rejection> {
     state.metrics.inc_queries_served();
     let path_str = path.as_str();
-    // Use x-user-id or extract from AWS Authorization header
     let user_id = extract_aws_user(auth_header.as_deref());
     if let Some(uid) = &user_id {
         state.metrics.record_user(uid.clone());
@@ -605,12 +614,14 @@ async fn handle_get(
         debug!("handle_head: path={}", path_str);
     
         if path_str.is_empty() {
-            warn!("HEAD request to root is not supported with current proxy_head implementation.");
-            return Ok(Box::new(warp::reply::with_status(
-                "Method Not Allowed at Root",
-                warp::http::StatusCode::METHOD_NOT_ALLOWED,
-            )));
-        }
+        // This is a HEAD on the bucket. S3 returns 200 OK if bucket exists.
+        // Our "datalake" bucket always exists.
+        info!("HEAD on bucket successful");
+        return Ok(Box::new(warp::reply::with_status(
+            "",
+            warp::http::StatusCode::OK,
+        )));
+    }
     
         // Extract table alias and relative file path
         let (table_alias, file_path) = match path_str.split_once('/') {
@@ -921,7 +932,8 @@ async fn proxy_to_s3(
         state.config.auth_mode
     };
 
-    if auth_mode == AuthMode::Forward {
+    if auth_mode == AuthMode::Forward || method.as_str() == "PROPFIND" {
+        info!("Forwarding {} request for {}", method, s3_key);
         return proxy_s3_forward(
             method,
             bucket,
@@ -1036,10 +1048,12 @@ async fn proxy_to_s3(
             Ok(Box::new(resp))
         }
 
-        _ => Ok(Box::new(warp::reply::with_status(
+        _ => {
+            warn!("Unsupported method received: {}", method);
+            Ok(Box::new(warp::reply::with_status(
             "Method Not Allowed",
             warp::http::StatusCode::METHOD_NOT_ALLOWED,
-        ))),
+        )))},
     }
 }
 
