@@ -147,27 +147,29 @@ async fn main() {
         .and(datalake_prefix.clone())
         .and(warp::header::optional("authorization"))
         .and(warp::path::tail())
-        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
         .and(warp::header::headers_cloned())
         .and(with_state(state.clone()))
         .and_then(handle_get);
 
     // Other methods: transparent proxy
     let other_routes = warp::method()
-        .and_then(|method: Method| async move {
-            if method == Method::GET || method == Method::HEAD {
-                Err(warp::reject())
-            } else {
-                Ok(method)
-            }
-        })
         .and(datalake_prefix.clone())
         .and(warp::path::tail())
         .and(warp::header::headers_cloned())
         .and(warp::body::stream())
         .and(with_state(state.clone()))
-        .and_then(|method, path, headers, body, state| {
-            proxy_to_s3(method, path, headers, body, state)
+        .and_then(|method: Method, path, headers, body, state| async move {
+            if method == Method::GET || method == Method::HEAD {
+                // If we reached here with GET/HEAD, it means the specific GET/HEAD routes failed to match.
+                // This usually happens if the query string was invalid (handled by handle_rejection now)
+                // or if some other filter failed.
+                // We should NOT process it as a proxy request.
+                // We return a rejection so that handle_rejection can pick up the original error (e.g. InvalidQuery).
+                Err(warp::reject::not_found())
+            } else {
+                proxy_to_s3(method, path, headers, body, state).await
+            }
         });
 
     // HEAD route: handle partition-aware HEAD requests
@@ -175,7 +177,7 @@ async fn main() {
         .and(datalake_prefix.clone())
         .and(warp::header::optional("authorization"))
         .and(warp::path::tail())
-        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
         .and(warp::header::headers_cloned())
         .and(with_state(state.clone()))
         .and_then(handle_head_wrapper);
@@ -444,7 +446,7 @@ async fn get_allowed_files_for_table(
 async fn handle_get(
     auth_header: Option<String>,
     path: warp::path::Tail,
-    query: HashMap<String, String>,
+    query_str: Option<String>,
     headers: HeaderMap,
     state: Arc<AppState>,
 ) -> Result<Box<dyn Reply>, warp::Rejection> {
@@ -455,7 +457,16 @@ async fn handle_get(
         state.metrics.record_user(uid.clone());
     }
 
-    debug!("handle_get: path={}, query={:?}, user={:?}", path_str, query, user_id);
+    // Parse query string leniently for our internal logic
+    let query: HashMap<String, String> = if let Some(qs) = &query_str {
+        url::form_urlencoded::parse(qs.as_bytes())
+            .into_owned()
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    debug!("handle_get: path={}, query_raw={:?}, parsed={:?}, user={:?}", path_str, query_str, query, user_id);
 
     // Handle root listing
     if path_str.is_empty() {
@@ -618,7 +629,7 @@ async fn handle_get(
     async fn handle_head_wrapper(
         _auth_header: Option<String>,
         path: warp::path::Tail,
-        _query: HashMap<String, String>,
+        _query_str: Option<String>,
         _headers: HeaderMap,
         state: Arc<AppState>,
     ) -> Result<Box<dyn Reply>, warp::Rejection> {
@@ -1105,7 +1116,14 @@ async fn handle_rejection(err: warp::Rejection) -> Result<impl Reply, std::conve
             "Bad Request".to_string(),
             StatusCode::BAD_REQUEST,
         ))
+    } else if let Some(_) = err.find::<warp::reject::InvalidQuery>() {
+        error!("Invalid Query String: {:?}", err);
+        Ok(warp::reply::with_status(
+            "Invalid Query String".to_string(),
+            StatusCode::BAD_REQUEST,
+        ))
     } else if let Some(_) = err.find::<warp::reject::MethodNotAllowed>() {
+        error!("Method Not Allowed: {:?}", err);
         Ok(warp::reply::with_status(
             "Method Not Allowed".to_string(),
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1223,7 +1241,7 @@ mod tests {
             .and(warp::path("datalake"))
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
             .and(warp::header::headers_cloned())
             .and(with_state(state.clone()))
             .and_then(|auth_header, path, query, headers, state| handle_get(auth_header, path, query, headers, state));
@@ -1274,7 +1292,7 @@ mod tests {
             .and(warp::path("datalake"))
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
             .and(warp::header::headers_cloned())
             .and(with_state(state.clone()))
             .and_then(|auth_header, path, query, headers, state| handle_get(auth_header, path, query, headers, state));
@@ -1325,7 +1343,7 @@ mod tests {
             .and(warp::path("datalake"))
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
             .and(warp::header::headers_cloned())
             .and(with_state(state.clone()))
             .and_then(|auth_header, path, query, headers, state| handle_get(auth_header, path, query, headers, state));
@@ -1361,7 +1379,7 @@ mod tests {
             .and(warp::path("datalake"))
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
             .and(warp::header::headers_cloned())
             .and(with_state(state.clone()))
             .and_then(|auth_header, path, query, headers, state| handle_get(auth_header, path, query, headers, state));
@@ -1399,7 +1417,7 @@ mod tests {
             .and(datalake_prefix.clone())
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
             .and(warp::header::headers_cloned())
             .and(with_state(state.clone()))
             .and_then(handle_head_wrapper);
