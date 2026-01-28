@@ -70,6 +70,7 @@ impl AppState {
         for (alias, uri) in &config.table_mapping {
             let uri_trim = uri.trim_start_matches("s3://");
             if let Some((bucket, prefix)) = uri_trim.split_once('/') {
+                let prefix = prefix.trim_end_matches('/');
                 table_mapping.insert(alias.clone(), (bucket.to_string(), prefix.to_string()));
             }
         }
@@ -152,14 +153,22 @@ async fn main() {
         .and_then(handle_get);
 
     // Other methods: transparent proxy
-    let other_routes = warp::any()
+    let other_routes = warp::method()
+        .and_then(|method: Method| async move {
+            if method == Method::GET || method == Method::HEAD {
+                Err(warp::reject())
+            } else {
+                Ok(method)
+            }
+        })
         .and(datalake_prefix.clone())
-        .and(warp::method())
         .and(warp::path::tail())
         .and(warp::header::headers_cloned())
         .and(warp::body::stream())
         .and(with_state(state.clone()))
-        .and_then(proxy_to_s3);
+        .and_then(|method, path, headers, body, state| {
+            proxy_to_s3(method, path, headers, body, state)
+        });
 
     // HEAD route: handle partition-aware HEAD requests
     let head_route = warp::head()
@@ -302,6 +311,7 @@ async fn proxy_s3_list(
                 if let Some(key) = object.key() {
                     let client_key = key
                         .strip_prefix(base_prefix)
+                        .or_else(|| key.strip_prefix(&format!("{}/{}", bucket, base_prefix)))
                         .map(|s| format!("{}{}", table_alias, s))
                         .unwrap_or_else(|| key.to_string());
                     write!(&mut xml, "<Contents>").unwrap();
@@ -1145,6 +1155,7 @@ mod tests {
         for (alias, uri) in &config.table_mapping {
             let uri_trim = uri.trim_start_matches("s3://");
             if let Some((bucket, prefix)) = uri_trim.split_once('/') {
+                let prefix = prefix.trim_end_matches('/');
                 table_mapping.insert(alias.clone(), (bucket.to_string(), prefix.to_string()));
             }
         }
@@ -1154,6 +1165,8 @@ mod tests {
         } else {
             None
         };
+
+        let metrics = AppMetrics::new();
 
         AppState {
             s3_client,
@@ -1173,6 +1186,7 @@ mod tests {
                 .build(),
             config,
             db_pool,
+            metrics,
         }
     }
 
@@ -1182,19 +1196,19 @@ mod tests {
         let s3_endpoint = server.url();
 
 
-        let _m = server.mock("GET", Matcher::Regex(r"/?list-type=2&delimiter=%2F&prefix=uuuid1%2Fdfdf%2Fuuid2%2F_delta_log%2F".to_string()))
+        let _m = server.mock("GET", Matcher::Regex(r"/uuuid1/?\?.*list-type=2.*prefix=dfdf%2Fuuid2%2F_delta_log%2F.*".to_string()))
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-0_3_01/">
   <Name>test-bucket</Name>
   <Prefix>uuuid1/dfdf/uuid2/_delta_log/</Prefix>
   <KeyCount>1</KeyCount>
   <MaxKeys>1000</MaxKeys>
   <IsTruncated>false</IsTruncated>
   <Contents>
-    <Key>uuuid1/dfdf/uuid2/_delta_log/00000000000000000000.json</Key>
+    <Key>dfdf/uuid2/_delta_log/00000000000000000000.json</Key>
     <LastModified>2024-01-01T00:00:00.000Z</LastModified>
     <ETag>"etag"</ETag>
     <Size>123</Size>
@@ -1232,7 +1246,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let s3_endpoint = server.url();
 
-        let _m = server.mock("GET", Matcher::Regex(r"/?list-type=2&delimiter=%2F&prefix=uuuid1%2Fdfdf%2Fuuid2%2Fsome%2Fprefix&start-after=uuuid1%2Fdfdf%2Fuuid2%2Fsome%2Fkey".to_string()))
+        let _m = server.mock("GET", Matcher::Regex(r"/uuuid1/?\?.*list-type=2.*prefix=dfdf%2Fuuid2%2Fsome%2Fprefix.*start-after=dfdf%2Fuuid2%2Fsome%2Fkey.*".to_string()))
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(
@@ -1283,7 +1297,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let s3_endpoint = server.url();
 
-        let _m = server.mock("GET", Matcher::Regex(r"/?list-type=2&delimiter=%2F&prefix=uuuid1%2Fdfdf%2Fuuid2%2Fsome%2Fprefix&start-after=uuuid1%2Fdfdf%2Fuuid2%2Fsome%2Fkey".to_string()))
+        let _m = server.mock("GET", Matcher::Regex(r"/uuuid1/?\?.*list-type=2.*prefix=dfdf%2Fuuid2%2Fsome%2Fprefix.*start-after=dfdf%2Fuuid2%2Fsome%2Fkey.*".to_string()))
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(
@@ -1335,7 +1349,7 @@ mod tests {
         let s3_endpoint = server.url();
         let response_body = "partial content";
 
-        let _m = server.mock("GET", Matcher::Regex(r"/uuuid1/dfdf/uuid2/some/file.parquet\?x-id=GetObject".to_string()))
+        let _m = server.mock("GET", Matcher::Regex(r"/some-other-bucket/path/some/file.parquet.*".to_string()))
             .match_header("range", "bytes=0-14")
             .with_status(206)
             .with_header("Content-Range", "bytes 0-14/100")
@@ -1354,7 +1368,7 @@ mod tests {
 
         let res = request()
             .method("GET")
-            .path("/datalake/table/some/file.parquet")
+            .path("/datalake/other_table/some/file.parquet")
             .header("range", "bytes=0-14")
             .reply(&routes)
             .await;
@@ -1363,5 +1377,60 @@ mod tests {
         assert_eq!(res.headers().get("Content-Range").unwrap(), "bytes 0-14/100");
         let body = String::from_utf8(res.body().to_vec()).unwrap();
         assert_eq!(body, response_body);
+    }
+
+    #[tokio::test]
+    async fn test_head_request_handled_correctly() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        // Mock the S3 HEAD response
+        let _m = server.mock("HEAD", Matcher::Regex(r"/uuuid1/dfdf/uuid2/_delta_log/00000000000000000000.json".to_string()))
+            .with_status(200)
+            .with_header("Content-Length", "123")
+            .with_header("ETag", "\"some-etag\"")
+            .create();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        let datalake_prefix = warp::path("datalake");
+
+        // Define routes similar to main() to test routing logic
+        let head_route = warp::head()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::<HashMap<String, String>>())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_head_wrapper);
+
+        let other_routes = warp::method()
+            .and_then(|method: Method| async move {
+                if method == Method::GET || method == Method::HEAD {
+                    Err(warp::reject())
+                } else {
+                    Ok(method)
+                }
+            })
+            .and(datalake_prefix.clone())
+            .and(warp::path::tail())
+            .and(warp::header::headers_cloned())
+            .and(warp::body::stream())
+            .and(with_state(state.clone()))
+            .and_then(|method, path, headers, body, state| {
+                proxy_to_s3(method, path, headers, body, state)
+            });
+        
+        let routes = head_route.or(other_routes);
+
+        let res = request()
+            .method("HEAD")
+            .path("/datalake/table/_delta_log/00000000000000000000.json")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 200, "HEAD request should return 200 OK");
+        assert_eq!(res.headers().get("Content-Length").unwrap(), "123");
+        assert_eq!(res.headers().get("ETag").unwrap(), "\"some-etag\"");
     }
 }

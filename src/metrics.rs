@@ -1,9 +1,11 @@
 use prometheus::{opts, register_counter, register_gauge, Counter, Gauge, Encoder};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::interval;
 use warp::{Filter, Rejection, Reply};
+
+static METRICS: OnceLock<Arc<AppMetrics>> = OnceLock::new();
 
 pub struct AppMetrics {
     queries_served_total: Counter,
@@ -20,43 +22,45 @@ pub struct AppMetrics {
 
 impl AppMetrics {
     pub fn new() -> Arc<Self> {
-        let queries_served_total = register_counter!(opts!(
-            "queries_served_total",
-            "Total number of queries served."
-        ))
-        .unwrap();
-        let queries_proxied_total = register_counter!(opts!(
-            "queries_proxied_total",
-            "Total number of queries proxied."
-        ))
-        .unwrap();
+        METRICS.get_or_init(|| {
+            let queries_served_total = register_counter!(opts!(
+                "queries_served_total",
+                "Total number of queries served."
+            ))
+            .unwrap();
+            let queries_proxied_total = register_counter!(opts!(
+                "queries_proxied_total",
+                "Total number of queries proxied."
+            ))
+            .unwrap();
 
-        let unique_users_last_minute = register_gauge!(opts!(
-            "unique_users_last_minute",
-            "Number of unique users in the last minute."
-        ))
-        .unwrap();
-        let backend_reply_latency_seconds_avg = register_gauge!(opts!(
-            "backend_reply_latency_seconds_avg",
-            "Average backend reply latency in seconds over the last minute."
-        ))
-        .unwrap();
-        let average_message_size_bytes = register_gauge!(opts!(
-            "average_message_size_bytes",
-            "Average message size in bytes over the last minute."
-        ))
-        .unwrap();
+            let unique_users_last_minute = register_gauge!(opts!(
+                "unique_users_last_minute",
+                "Number of unique users in the last minute."
+            ))
+            .unwrap();
+            let backend_reply_latency_seconds_avg = register_gauge!(opts!(
+                "backend_reply_latency_seconds_avg",
+                "Average backend reply latency in seconds over the last minute."
+            ))
+            .unwrap();
+            let average_message_size_bytes = register_gauge!(opts!(
+                "average_message_size_bytes",
+                "Average message size in bytes over the last minute."
+            ))
+            .unwrap();
 
-        Arc::new(AppMetrics {
-            queries_served_total,
-            queries_proxied_total,
-            raw_user_ids_this_minute: Arc::new(Mutex::new(HashSet::new())),
-            raw_backend_latencies_this_minute: Arc::new(Mutex::new(Vec::new())),
-            raw_message_sizes_this_minute: Arc::new(Mutex::new(Vec::new())),
-            unique_users_last_minute,
-            backend_reply_latency_seconds_avg,
-            average_message_size_bytes,
-        })
+            Arc::new(AppMetrics {
+                queries_served_total,
+                queries_proxied_total,
+                raw_user_ids_this_minute: Arc::new(Mutex::new(HashSet::new())),
+                raw_backend_latencies_this_minute: Arc::new(Mutex::new(Vec::new())),
+                raw_message_sizes_this_minute: Arc::new(Mutex::new(Vec::new())),
+                unique_users_last_minute,
+                backend_reply_latency_seconds_avg,
+                average_message_size_bytes,
+            })
+        }).clone()
     }
 
     pub fn inc_queries_served(&self) {

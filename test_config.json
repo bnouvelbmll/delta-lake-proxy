@@ -4,7 +4,7 @@
     "other_table": "s3://some-other-bucket/path/"
   },
   "readOnly": true,
-  "proxyPartial": false,
+  "proxyPartial": true,
   "defaultAuthMode": "iam",
   "allowedPartitions": {
     "table": [

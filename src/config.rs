@@ -4,7 +4,6 @@ use std::collections::HashMap;
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    #[serde(rename = "table_mapping")]
     pub table_mapping: HashMap<String, String>,
     #[serde(default = "read_only")]
     pub read_only: bool,
