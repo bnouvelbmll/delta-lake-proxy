@@ -91,13 +91,21 @@ async def handle_connect(reader, writer, first_line):
         logger.info(f"Sent 200 Connection Established to {target}")
         
         # 2. Upgrade to SSL (MITM)
-        # Use PROTOCOL_TLS_SERVER for server-side
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Use PROTOCOL_TLS for maximum compatibility (negotiates highest common version)
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
         ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
-        # No client cert verification - just encryption
+        
+        # No client cert verification
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
         
+        # maximize compatibility for older clients (Java 8 etc)
+        try:
+            ssl_ctx.set_ciphers('DEFAULT:@SECLEVEL=0')
+        except Exception:
+            # Some systems don't support setting SECLEVEL=0
+            pass
+            
         logger.info("Starting TLS handshake...")
         # This requires Python 3.11+
         new_reader = await writer.start_tls(ssl_ctx)
@@ -114,6 +122,15 @@ async def handle_connect(reader, writer, first_line):
         # 4. Handle as standard HTTP request, but upstream is HTTPS
         await handle_http(new_reader, writer, initial_data, scheme="https", target_host=host)
         
+    except ssl.SSLError as e:
+        logger.error(f"MITM SSL Error to {target}: {e}")
+        if "CERTIFICATE_UNKNOWN" in str(e) or "alert unknown ca" in str(e).lower():
+            logger.error(f"{Colors.RED}Client rejected our self-signed certificate!{Colors.RESET}")
+            logger.error(f"{Colors.YELLOW}To fix this, you must disable SSL verification in your client (Spark/Hadoop):{Colors.RESET}")
+            logger.error(f"  Option A: {Colors.CYAN}--conf spark.hadoop.fs.s3a.ssl.channel.mode=insecure{Colors.RESET}")
+            logger.error(f"  Option B: {Colors.CYAN}--conf spark.hadoop.fs.s3a.connection.ssl.enabled=false{Colors.RESET}")
+            logger.error(f"  Option C: Add {Colors.WHITE}{os.path.abspath(CA_CERT)}{Colors.YELLOW} to your Java TrustStore.{Colors.RESET}")
+        writer.close()
     except Exception as e:
         logger.error(f"MITM CONNECT error to {target}: {e}")
         writer.close()
@@ -206,42 +223,77 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
                 if not chunk: break
                 yield chunk
 
-        # 4. Execute Request via aiohttp
+        # 4. Execute Request via aiohttp with Custom Redirect Logic
         async with ClientSession(auto_decompress=False) as session:
-            async with session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                data=request_body_stream() if method in ['PUT', 'POST'] else None,
-                allow_redirects=False
-            ) as resp:
+            current_url = url
+            current_headers = headers.copy()
+            current_method = method
+            
+            for attempt in range(6): # 5 redirects max
+                # Note: If request_body_stream is a generator, it can only be consumed once.
+                # This logic assumes GET requests or that body replay isn't needed/possible for redirects.
+                req_data = request_body_stream() if current_method in ['PUT', 'POST'] else None
                 
-                # 5. Send Response to Client
-                reason = resp.reason if resp.reason else "OK"
-                status_line = f"HTTP/1.1 {resp.status} {reason}\r\n"
-                writer.write(status_line.encode())
-                
-                for k, v in resp.headers.items():
-                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding', 'keep-alive', 'proxy-connection']:
-                        writer.write(f"{k}: {v}\r\n".encode())
-                
-                if 'Content-Encoding' in resp.headers:
-                    writer.write(f"Content-Encoding: {resp.headers['Content-Encoding']}\r\n".encode())
-
-                writer.write(b"Connection: close\r\n")
-                writer.write(b"\r\n")
-                await writer.drain()
+                # Manually manage the response lifecycle
+                resp = await session.request(
+                    method=current_method,
+                    url=current_url,
+                    headers=current_headers,
+                    data=req_data,
+                    allow_redirects=False
+                ).__aenter__()
                 
                 try:
-                    async for chunk in resp.content.iter_chunked(8192):
-                        writer.write(chunk)
-                        await writer.drain()
-                except Exception as e:
-                    logger.error(f"Error streaming response body: {e}")
-                    raise e
-                
-                duration = (time.time() - start_time) * 1000
-                log_request(method, url, resp.status, duration)
+                    if resp.status in [301, 302, 303, 307, 308] and 'Location' in resp.headers:
+                        redirect_url = resp.headers['Location']
+                        logger.info(f"Redirect detected ({resp.status}). Following to: {redirect_url}")
+                        
+                        # Update URL
+                        current_url = redirect_url
+                        
+                        # Strip Authorization for the redirect
+                        if 'authorization' in current_headers:
+                            del current_headers['authorization']
+                        
+                        # Handle 303 See Other -> Change to GET
+                        if resp.status == 303:
+                            current_method = 'GET'
+                        
+                        # Close this response and continue loop
+                        resp.close()
+                        continue
+                    
+                    # If not a redirect, or limit reached, stream this response back
+                    reason = resp.reason if resp.reason else "OK"
+                    status_line = f"HTTP/1.1 {resp.status} {reason}\r\n"
+                    writer.write(status_line.encode())
+                    
+                    for k, v in resp.headers.items():
+                        if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding', 'keep-alive', 'proxy-connection']:
+                            writer.write(f"{k}: {v}\r\n".encode())
+                    
+                    if 'Content-Encoding' in resp.headers:
+                        writer.write(f"Content-Encoding: {resp.headers['Content-Encoding']}\r\n".encode())
+
+                    writer.write(b"Connection: close\r\n")
+                    writer.write(b"\r\n")
+                    await writer.drain()
+                    
+                    try:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            writer.write(chunk)
+                            await writer.drain()
+                    except Exception as e:
+                        logger.error(f"Error streaming response body: {e}")
+                        raise e
+                    
+                    duration = (time.time() - start_time) * 1000
+                    log_request(method, url, resp.status, duration)
+                    return # Done
+                    
+                finally:
+                    if not resp.closed:
+                        resp.close()
 
     except Exception as e:
         logger.error(f"HTTP Proxy Error: {e}")
