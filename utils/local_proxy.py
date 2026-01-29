@@ -235,6 +235,9 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
                 req_data = request_body_stream() if current_method in ['PUT', 'POST'] else None
                 
                 # Manually manage the response lifecycle
+                logger.info(f"Attempt {attempt+1}: {current_method} {current_url}")
+                logger.debug(f"Request Headers: {current_headers}")
+
                 resp = await session.request(
                     method=current_method,
                     url=current_url,
@@ -244,6 +247,9 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
                 ).__aenter__()
                 
                 try:
+                    logger.debug(f"Response Status: {resp.status}")
+                    logger.debug(f"Response Headers: {resp.headers}")
+
                     if resp.status in [301, 302, 303, 307, 308] and 'Location' in resp.headers:
                         redirect_url = resp.headers['Location']
                         logger.info(f"Redirect detected ({resp.status}). Following to: {redirect_url}")
@@ -253,6 +259,7 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
                         
                         # Strip Authorization for the redirect
                         if 'authorization' in current_headers:
+                            logger.info("Stripping Authorization header for redirect")
                             del current_headers['authorization']
                         
                         # Handle 303 See Other -> Change to GET
