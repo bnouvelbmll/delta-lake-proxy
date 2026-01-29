@@ -48,7 +48,10 @@ def modify_request(request_data, host_label):
         line_sep = '\r\n' if '\r\n' in header_text else '\n'
         lines = header_text.split(line_sep)
         
-        is_presigned = any(k in header_text for k in ["X-Amz-Signature=", "Signature="])
+        # Check presigned ONLY in the Request Line (first line)
+        # The Authorization header itself contains "Signature=", so checking the whole block is a bug.
+        first_line = lines[0] if lines else ""
+        is_presigned = any(k in first_line for k in ["X-Amz-Signature=", "Signature="])
         
         new_lines = []
         for line in lines:
@@ -67,7 +70,7 @@ def modify_request(request_data, host_label):
         new_lines.append("Connection: close")
         
         new_header_text = line_sep.join(new_lines)
-        logger.debug(f"Modified Headers:\n{new_header_text}")
+        # logger.debug(f"Modified Headers:\n{new_header_text}")
         
         return new_header_text.encode() + (sep if sep else b'\r\n\r\n') + body_part
     except Exception as e:
@@ -173,7 +176,14 @@ async def handle_standard_http(reader, writer, initial_data):
         
         if dest_writer:
             dest_writer.close()
+            # await dest_writer.wait_closed() # Optional, but good practice
+        
         writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+            
         latency = (time.time() - start_time) * 1000
         logger.info(f"REQ: {method} {url_str} -> {status_code} ({latency:.2f}ms)")
 
@@ -225,6 +235,10 @@ async def handle_client(reader, writer):
             except asyncio.CancelledError:
                 pass
         writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def main():
     ensure_ca()
