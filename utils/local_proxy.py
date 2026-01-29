@@ -24,22 +24,47 @@ def ensure_ca():
             "-subj", "/CN=Spark-Proxy-CA"
         ], check=True, capture_output=True)
 
-def strip_auth_if_presigned(request_text, host_label):
-    is_presigned = any(k in request_text for k in ["X-Amz-Signature=", "Signature="])
-    lines = request_text.split('\r\n')
-    modified_lines = []
-    for line in lines:
-        if is_presigned and line.lower().startswith("authorization:"):
-            logger.info(f"STRIP: Removed Auth header for {host_label}")
-            continue
-        modified_lines.append(line)
-    return '\r\n'.join(modified_lines).encode()
+def modify_request(request_data, host_label):
+    try:
+        # Split headers and body
+        parts = request_data.split(b'\r\n\r\n', 1)
+        header_part = parts[0].decode(errors='ignore')
+        body_part = parts[1] if len(parts) > 1 else b""
+        
+        is_presigned = any(k in header_part for k in ["X-Amz-Signature=", "Signature="])
+        
+        lines = header_part.split('\r\n')
+        new_lines = []
+        
+        for line in lines:
+            lower_line = line.lower()
+            # Strip Authorization if presigned
+            if is_presigned and lower_line.startswith("authorization:"):
+                logger.info(f"STRIP: Removed Auth header for {host_label}")
+                continue
+            # Remove existing Connection header
+            if lower_line.startswith("connection:"):
+                continue
+            # Remove Proxy-Connection header (sometimes sent by clients)
+            if lower_line.startswith("proxy-connection:"):
+                continue
+            new_lines.append(line)
+            
+        # Force Connection: close to prevent hanging on Keep-Alive
+        new_lines.append("Connection: close")
+        
+        new_header_part = '\r\n'.join(new_lines).encode()
+        return new_header_part + b'\r\n\r\n' + body_part
+    except Exception as e:
+        logger.error(f"Error modifying request: {e}")
+        return request_data
 
 async def handle_standard_http(reader, writer, initial_data):
     start_time = time.time()
     method = "UNKNOWN"
     url_str = "UNKNOWN"
     status_code = 0
+    dest_writer = None
     
     try:
         request_text = initial_data.decode(errors='ignore')
@@ -77,7 +102,7 @@ async def handle_standard_http(reader, writer, initial_data):
 
         # logger.info(f"HTTP: Forwarding to {host}:{port}")
         
-        payload = strip_auth_if_presigned(request_text, f"{host}:{port}")
+        payload = modify_request(initial_data, f"{host}:{port}")
         
         # 3. Establish connection to the non-standard port
         dest_reader, dest_writer = await asyncio.open_connection(host, port)
@@ -110,7 +135,9 @@ async def handle_standard_http(reader, writer, initial_data):
         logger.error(f"HTTP Error: {e}")
         status_code = 500
     finally:
-        writer.close()
+        if dest_writer:
+            dest_writer.close()
+        # writer.close() is handled by caller
         latency = (time.time() - start_time) * 1000
         logger.info(f"REQ: {method} {url_str} -> {status_code} ({latency:.2f}ms)")
 
@@ -133,7 +160,7 @@ async def handle_client(reader, writer):
             await writer.start_tls(ssl_ctx)
 
             inner_data = await reader.read(8192)
-            payload = strip_auth_if_presigned(inner_data.decode(errors='ignore'), target)
+            payload = modify_request(inner_data, target)
 
             d_reader, d_writer = await asyncio.open_connection(host, int(port), ssl=True)
             d_writer.write(payload)
@@ -144,6 +171,8 @@ async def handle_client(reader, writer):
                 if not chunk: break
                 writer.write(chunk)
                 await writer.drain()
+            
+            d_writer.close()
         else:
             await handle_standard_http(reader, writer, initial_data)
     except Exception as e:
