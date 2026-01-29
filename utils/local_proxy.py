@@ -45,7 +45,7 @@ def modify_request(request_data, host_label):
             # Remove existing Connection header
             if lower_line.startswith("connection:"):
                 continue
-            # Remove Proxy-Connection header (sometimes sent by clients)
+            # Remove Proxy-Connection header
             if lower_line.startswith("proxy-connection:"):
                 continue
             new_lines.append(line)
@@ -58,6 +58,18 @@ def modify_request(request_data, host_label):
     except Exception as e:
         logger.error(f"Error modifying request: {e}")
         return request_data
+
+async def pipe_stream(reader, writer):
+    """Pipes data from reader to writer until reader is closed."""
+    try:
+        while True:
+            data = await reader.read(8192)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
 
 async def handle_standard_http(reader, writer, initial_data):
     start_time = time.time()
@@ -83,7 +95,7 @@ async def handle_standard_http(reader, writer, initial_data):
         else:
             return
 
-        # 2. Fallback: Parse from Host Header if URL was relative
+        # Fallback: Parse from Host Header
         if not host:
             for line in lines:
                 if line.lower().startswith("host:"):
@@ -100,16 +112,20 @@ async def handle_standard_http(reader, writer, initial_data):
             logger.error("Could not determine target host.")
             return
 
-        # logger.info(f"HTTP: Forwarding to {host}:{port}")
-        
         payload = modify_request(initial_data, f"{host}:{port}")
         
-        # 3. Establish connection to the non-standard port
+        # Establish connection
         dest_reader, dest_writer = await asyncio.open_connection(host, port)
         dest_writer.write(payload)
         await dest_writer.drain()
 
-        # Read response to get status code
+        # Bidirectional streaming
+        # We start a task to forward the rest of the request (Client -> Server)
+        # We await the response (Server -> Client) in the main flow
+        
+        req_task = asyncio.create_task(pipe_stream(reader, dest_writer))
+        
+        # Read response and log status
         first_chunk = True
         while True:
             chunk = await dest_reader.read(8192)
@@ -130,6 +146,9 @@ async def handle_standard_http(reader, writer, initial_data):
 
             writer.write(chunk)
             await writer.drain()
+        
+        # When response is done, cancel the request forwarding task
+        req_task.cancel()
             
     except Exception as e:
         logger.error(f"HTTP Error: {e}")
@@ -137,7 +156,7 @@ async def handle_standard_http(reader, writer, initial_data):
     finally:
         if dest_writer:
             dest_writer.close()
-        # writer.close() is handled by caller
+        writer.close()
         latency = (time.time() - start_time) * 1000
         logger.info(f"REQ: {method} {url_str} -> {status_code} ({latency:.2f}ms)")
 
@@ -147,7 +166,7 @@ async def handle_client(reader, writer):
         if not initial_data: return
 
         if initial_data.startswith(b"CONNECT"):
-            # HTTPS logic (simplified)
+            # HTTPS logic
             first_line = initial_data.decode().split('\r\n')[0]
             target = first_line.split(' ')[1]
             host, port = target.split(':')
@@ -166,12 +185,16 @@ async def handle_client(reader, writer):
             d_writer.write(payload)
             await d_writer.drain()
 
+            # Bidirectional streaming for HTTPS
+            req_task = asyncio.create_task(pipe_stream(reader, d_writer))
+            
             while True:
                 chunk = await d_reader.read(8192)
                 if not chunk: break
                 writer.write(chunk)
                 await writer.drain()
             
+            req_task.cancel()
             d_writer.close()
         else:
             await handle_standard_http(reader, writer, initial_data)
@@ -189,4 +212,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
