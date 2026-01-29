@@ -26,35 +26,50 @@ def ensure_ca():
 
 def modify_request(request_data, host_label):
     try:
-        # Split headers and body
-        parts = request_data.split(b'\r\n\r\n', 1)
-        header_part = parts[0].decode(errors='ignore')
-        body_part = parts[1] if len(parts) > 1 else b""
+        # Detect separator
+        sep = b'\r\n\r\n'
+        if sep not in request_data:
+            sep = b'\n\n'
+            if sep not in request_data:
+                # Could be just headers?
+                sep = b''
         
-        is_presigned = any(k in header_part for k in ["X-Amz-Signature=", "Signature="])
+        if sep:
+            parts = request_data.split(sep, 1)
+            header_bytes = parts[0]
+            body_part = parts[1]
+        else:
+            header_bytes = request_data
+            body_part = b""
+
+        header_text = header_bytes.decode(errors='ignore')
         
-        lines = header_part.split('\r\n')
+        # Detect line ending
+        line_sep = '\r\n' if '\r\n' in header_text else '\n'
+        lines = header_text.split(line_sep)
+        
+        is_presigned = any(k in header_text for k in ["X-Amz-Signature=", "Signature="])
+        
         new_lines = []
-        
         for line in lines:
             lower_line = line.lower()
-            # Strip Authorization if presigned
             if is_presigned and lower_line.startswith("authorization:"):
                 logger.info(f"STRIP: Removed Auth header for {host_label}")
                 continue
-            # Remove existing Connection header
             if lower_line.startswith("connection:"):
                 continue
-            # Remove Proxy-Connection header
             if lower_line.startswith("proxy-connection:"):
+                continue
+            if lower_line.strip() == "":
                 continue
             new_lines.append(line)
             
-        # Force Connection: close to prevent hanging on Keep-Alive
         new_lines.append("Connection: close")
         
-        new_header_part = '\r\n'.join(new_lines).encode()
-        return new_header_part + b'\r\n\r\n' + body_part
+        new_header_text = line_sep.join(new_lines)
+        logger.debug(f"Modified Headers:\n{new_header_text}")
+        
+        return new_header_text.encode() + (sep if sep else b'\r\n\r\n') + body_part
     except Exception as e:
         logger.error(f"Error modifying request: {e}")
         return request_data
@@ -77,11 +92,12 @@ async def handle_standard_http(reader, writer, initial_data):
     url_str = "UNKNOWN"
     status_code = 0
     dest_writer = None
+    req_task = None
     
     try:
         request_text = initial_data.decode(errors='ignore')
-        lines = request_text.split('\r\n')
-        first_line = lines[0]
+        lines = request_text.split('\n') # Simple split for first line
+        first_line = lines[0].strip()
         
         # Parse Method and URL
         parts = first_line.split(' ')
@@ -120,12 +136,9 @@ async def handle_standard_http(reader, writer, initial_data):
         await dest_writer.drain()
 
         # Bidirectional streaming
-        # We start a task to forward the rest of the request (Client -> Server)
-        # We await the response (Server -> Client) in the main flow
-        
         req_task = asyncio.create_task(pipe_stream(reader, dest_writer))
         
-        # Read response and log status
+        # Read response
         first_chunk = True
         while True:
             chunk = await dest_reader.read(8192)
@@ -134,9 +147,9 @@ async def handle_standard_http(reader, writer, initial_data):
             if first_chunk:
                 try:
                     response_text = chunk.decode(errors='ignore')
-                    response_lines = response_text.split('\r\n')
+                    response_lines = response_text.split('\n')
                     if len(response_lines) > 0:
-                        status_line = response_lines[0]
+                        status_line = response_lines[0].strip()
                         status_parts = status_line.split(' ')
                         if len(status_parts) >= 2:
                             status_code = int(status_parts[1])
@@ -146,14 +159,18 @@ async def handle_standard_http(reader, writer, initial_data):
 
             writer.write(chunk)
             await writer.drain()
-        
-        # When response is done, cancel the request forwarding task
-        req_task.cancel()
             
     except Exception as e:
         logger.error(f"HTTP Error: {e}")
         status_code = 500
     finally:
+        if req_task:
+            req_task.cancel()
+            try:
+                await req_task
+            except asyncio.CancelledError:
+                pass
+        
         if dest_writer:
             dest_writer.close()
         writer.close()
@@ -161,13 +178,14 @@ async def handle_standard_http(reader, writer, initial_data):
         logger.info(f"REQ: {method} {url_str} -> {status_code} ({latency:.2f}ms)")
 
 async def handle_client(reader, writer):
+    req_task = None
     try:
         initial_data = await reader.read(8192)
         if not initial_data: return
 
         if initial_data.startswith(b"CONNECT"):
             # HTTPS logic
-            first_line = initial_data.decode().split('\r\n')[0]
+            first_line = initial_data.decode().split('\n')[0].strip()
             target = first_line.split(' ')[1]
             host, port = target.split(':')
             
@@ -194,13 +212,18 @@ async def handle_client(reader, writer):
                 writer.write(chunk)
                 await writer.drain()
             
-            req_task.cancel()
             d_writer.close()
         else:
             await handle_standard_http(reader, writer, initial_data)
     except Exception as e:
         logger.debug(f"Connection handled: {e}")
     finally:
+        if req_task:
+            req_task.cancel()
+            try:
+                await req_task
+            except asyncio.CancelledError:
+                pass
         writer.close()
 
 async def main():
