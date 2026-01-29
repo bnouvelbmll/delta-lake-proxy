@@ -192,8 +192,8 @@ async fn main() {
 
     let routes = list_buckets_route
         .or(head_root_route)
-        .or(get_route)
         .or(head_route)
+        .or(get_route)
         .or(other_routes)
         .recover(handle_rejection)
         .with(warp::trace::request());
@@ -353,6 +353,9 @@ async fn proxy_s3_list(
         }
         Err(e) => {
             error!("S3 List error: {:?}", e);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e {
+                error!("S3 Upstream response: {:?}", service_err.raw());
+            }
             Ok(Box::new(warp::reply::with_status(
                 "S3 List error",
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -763,6 +766,9 @@ async fn proxy_s3_get(
         }
         Err(err) => {
             error!("S3 GET error: {:?}", err);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
+                error!("S3 Upstream response: {:?}", service_err.raw());
+            }
             Ok(warp::reply::with_status(
                 "S3 GET error",
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -808,6 +814,9 @@ async fn proxy_s3_head(
         }
         Err(err) => {
             error!("S3 HEAD error: {:?}", err);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
+                error!("S3 Upstream response: {:?}", service_err.raw());
+            }
             Ok(warp::reply::with_status(
                 "S3 HEAD error",
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1008,6 +1017,9 @@ async fn proxy_to_s3(
                 }
                 Err(err) => {
                     error!("S3 HEAD error: {:?}", err);
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
+                        error!("S3 Upstream response: {:?}", service_err.raw());
+                    }
                     Ok(Box::new(warp::reply::with_status(
                         "S3 HEAD error",
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1037,6 +1049,9 @@ async fn proxy_to_s3(
                 ))),
                 Err(err) => {
                     error!("S3 PUT error: {:?}", err);
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
+                        error!("S3 Upstream response: {:?}", service_err.raw());
+                    }
                     Ok(Box::new(warp::reply::with_status(
                         "S3 PUT error",
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1066,6 +1081,9 @@ async fn proxy_to_s3(
                 ))),
                 Err(err) => {
                     error!("S3 POST error: {:?}", err);
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
+                        error!("S3 Upstream response: {:?}", service_err.raw());
+                    }
                     Ok(Box::new(warp::reply::with_status(
                         "S3 POST error",
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1422,6 +1440,15 @@ mod tests {
             .and(with_state(state.clone()))
             .and_then(handle_head_wrapper);
 
+        let get_route = warp::get()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_get);
+
         let other_routes = warp::method()
             .and_then(|method: Method| async move {
                 if method == Method::GET || method == Method::HEAD {
@@ -1439,7 +1466,7 @@ mod tests {
                 proxy_to_s3(method, path, headers, body, state)
             });
         
-        let routes = head_route.or(other_routes);
+        let routes = head_route.or(get_route).or(other_routes);
 
         let res = request()
             .method("HEAD")
@@ -1450,5 +1477,129 @@ mod tests {
         assert_eq!(res.status(), 200, "HEAD request should return 200 OK");
         assert_eq!(res.headers().get("Content-Length").unwrap(), "123");
         assert_eq!(res.headers().get("ETag").unwrap(), "\"some-etag\"");
+    }
+
+    #[tokio::test]
+    async fn test_head_request_on_bucket() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        let datalake_prefix = warp::path("datalake");
+
+        let head_route = warp::head()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_head_wrapper);
+        
+        let routes = head_route;
+
+        let res = request()
+            .method("HEAD")
+            .path("/datalake/")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 200, "HEAD request on bucket should return 200 OK");
+    }
+
+    #[tokio::test]
+    async fn test_head_request_on_table() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        // Mock the S3 HEAD response for the object that represents the table.
+        let _m = server.mock("HEAD", Matcher::Regex(r"/uuuid1/dfdf/uuid2/".to_string()))
+            .with_status(200)
+            .with_header("Content-Length", "0")
+            .with_header("ETag", "\"table-etag\"")
+            .create();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        let datalake_prefix = warp::path("datalake");
+
+        let head_route = warp::head()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_head_wrapper);
+        
+        let routes = head_route;
+
+        let res = request()
+            .method("HEAD")
+            .path("/datalake/table/")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 200, "HEAD request on table should return 200 OK");
+    }
+
+    #[tokio::test]
+    async fn test_head_request_non_existent_table() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        let datalake_prefix = warp::path("datalake");
+
+        let head_route = warp::head()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_head_wrapper);
+        
+        let routes = head_route;
+
+        let res = request()
+            .method("HEAD")
+            .path("/datalake/non_existent_table/")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 404, "HEAD request on non-existent table should return 404 Not Found");
+    }
+
+    #[tokio::test]
+    async fn test_head_request_non_existent_file() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        // Mock the S3 HEAD response for the non-existent object.
+        let _m = server.mock("HEAD", Matcher::Regex(r"/uuuid1/dfdf/uuid2/non_existent_file".to_string()))
+            .with_status(404)
+            .create();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        let datalake_prefix = warp::path("datalake");
+
+        let head_route = warp::head()
+            .and(datalake_prefix.clone())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
+            .and(warp::header::headers_cloned())
+            .and(with_state(state.clone()))
+            .and_then(handle_head_wrapper);
+        
+        let routes = head_route;
+
+        let res = request()
+            .method("HEAD")
+            .path("/datalake/table/non_existent_file")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 500, "HEAD request on non-existent file should return 500");
     }
 }
