@@ -2,6 +2,7 @@ import asyncio
 import ssl
 import logging
 import subprocess
+import time
 from pathlib import Path
 from yarl import URL  # Ensure 'pip install yarl'
 
@@ -35,21 +36,27 @@ def strip_auth_if_presigned(request_text, host_label):
     return '\r\n'.join(modified_lines).encode()
 
 async def handle_standard_http(reader, writer, initial_data):
+    start_time = time.time()
+    method = "UNKNOWN"
+    url_str = "UNKNOWN"
+    status_code = 0
+    
     try:
         request_text = initial_data.decode(errors='ignore')
         lines = request_text.split('\r\n')
         first_line = lines[0]
-        print(first_line)
-
-
-        # 1. Parse URL from Request Line (e.g., GET http://host:18080/path HTTP/1.1)
-        parts = first_line.split(' ')
-        if len(parts) < 2: return
-        raw_url = parts[1]
-        parsed = URL(raw_url)
         
-        host = parsed.host
-        port = parsed.port
+        # Parse Method and URL
+        parts = first_line.split(' ')
+        if len(parts) >= 2:
+            method = parts[0]
+            raw_url = parts[1]
+            url_str = raw_url
+            parsed = URL(raw_url)
+            host = parsed.host
+            port = parsed.port
+        else:
+            return
 
         # 2. Fallback: Parse from Host Header if URL was relative
         if not host:
@@ -68,7 +75,7 @@ async def handle_standard_http(reader, writer, initial_data):
             logger.error("Could not determine target host.")
             return
 
-        logger.info(f"HTTP: Forwarding to {host}:{port}")
+        # logger.info(f"HTTP: Forwarding to {host}:{port}")
         
         payload = strip_auth_if_presigned(request_text, f"{host}:{port}")
         
@@ -77,15 +84,35 @@ async def handle_standard_http(reader, writer, initial_data):
         dest_writer.write(payload)
         await dest_writer.drain()
 
+        # Read response to get status code
+        first_chunk = True
         while True:
             chunk = await dest_reader.read(8192)
             if not chunk: break
+            
+            if first_chunk:
+                try:
+                    response_text = chunk.decode(errors='ignore')
+                    response_lines = response_text.split('\r\n')
+                    if len(response_lines) > 0:
+                        status_line = response_lines[0]
+                        status_parts = status_line.split(' ')
+                        if len(status_parts) >= 2:
+                            status_code = int(status_parts[1])
+                except:
+                    pass
+                first_chunk = False
+
             writer.write(chunk)
             await writer.drain()
+            
     except Exception as e:
         logger.error(f"HTTP Error: {e}")
+        status_code = 500
     finally:
         writer.close()
+        latency = (time.time() - start_time) * 1000
+        logger.info(f"REQ: {method} {url_str} -> {status_code} ({latency:.2f}ms)")
 
 async def handle_client(reader, writer):
     try:
