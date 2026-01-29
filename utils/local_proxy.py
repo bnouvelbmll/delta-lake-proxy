@@ -117,7 +117,7 @@ async def handle_connect(reader, writer, first_line):
             logger.warning("No data received after TLS handshake")
             return
 
-        logger.info(f"Decrypted {len(initial_data)} bytes. First line: {initial_data.split(b'\n')[0]}")
+        logger.info("Decrypted {len(initial_data)} bytes. First line: "+initial_data.split(b'\n')[0])
 
         # 4. Handle as standard HTTP request, but upstream is HTTPS
         await handle_http(new_reader, writer, initial_data, scheme="https", target_host=host)
