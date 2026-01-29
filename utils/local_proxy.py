@@ -257,10 +257,12 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
                         # Update URL
                         current_url = redirect_url
                         
-                        # Strip Authorization for the redirect
-                        if 'authorization' in current_headers:
-                            logger.info("Stripping Authorization header for redirect")
-                            del current_headers['authorization']
+                        # Preserve only the Range header for the redirect, if present
+                        range_header_value = current_headers.get('range')
+                        current_headers.clear()
+                        if range_header_value:
+                            logger.info("Preserving Range header for redirect")
+                            current_headers['range'] = range_header_value
                         
                         # Handle 303 See Other -> Change to GET
                         if resp.status == 303:
