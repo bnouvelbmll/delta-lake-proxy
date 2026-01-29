@@ -1596,4 +1596,58 @@ mod tests {
 
         assert_eq!(res.status(), 404, "HEAD request on non-existent file should return 404");
     }
+
+    #[tokio::test]
+    async fn test_proxy_s3_list_continuation_token() {
+        let mut server = mockito::Server::new_async().await;
+        let s3_endpoint = server.url();
+
+        let _m = server.mock("GET", Matcher::Regex(r"/uuuid1/?\?.*list-type=2.*".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/xml")
+            .with_body(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>test-bucket</Name>
+  <Prefix>uuuid1/dfdf/uuid2/some/prefix</Prefix>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>next-token-123</NextContinuationToken>
+  <Contents>
+    <Key>uuuid1/dfdf/uuid2/some/prefix/file1.json</Key>
+  </Contents>
+</ListBucketResult>"#,
+            )
+            .create();
+
+        let state = Arc::new(test_app_state(&s3_endpoint).await);
+        
+        let routes = warp::path("datalake")
+            .and(warp::method())
+            .and(warp::header::optional("authorization"))
+            .and(warp::path::tail())
+            .and(
+                warp::query::raw()
+                    .map(Some)
+                    .or(warp::any().map(|| None))
+                    .unify(),
+            )
+            .and(warp::header::headers_cloned())
+            .and(warp::body::stream())
+            .and(with_state(state.clone()))
+            .and_then(dispatch_request);
+
+        let res = request()
+            .method("GET")
+            .path("/datalake/table/?list-type=2")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(res.status(), 200);
+        let body = String::from_utf8(res.body().to_vec()).unwrap();
+        println!("Body: {}", body);
+        assert!(body.contains("<NextContinuationToken>next-token-123</NextContinuationToken>"));
+        assert!(body.contains("<IsTruncated>true</IsTruncated>"));
+    }
 }
