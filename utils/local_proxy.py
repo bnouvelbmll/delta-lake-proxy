@@ -91,8 +91,12 @@ async def handle_connect(reader, writer, first_line):
         logger.info(f"Sent 200 Connection Established to {target}")
         
         # 2. Upgrade to SSL (MITM)
-        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        # Use PROTOCOL_TLS_SERVER for server-side
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
+        # No client cert verification - just encryption
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
         
         logger.info("Starting TLS handshake...")
         # This requires Python 3.11+
