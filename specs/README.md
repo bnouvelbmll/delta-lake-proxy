@@ -175,3 +175,10 @@ The application is configured via `config.json`.
   }
 }
 ```
+
+## 6. Client-Side Utilities
+
+### 6.1 Local Auth Proxy
+To address issues where clients (like Spark) incorrectly forward AWS IAM `Authorization` headers to pre-signed S3 URLs (causing S3 to reject the request), a local Python proxy is available.
+
+See [Client-Side Auth Proxy Specification](client_proxy.md) for details.
