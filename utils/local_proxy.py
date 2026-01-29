@@ -24,6 +24,22 @@ def ensure_ca():
             "-subj", "/CN=Spark-Proxy-CA"
         ], check=True, capture_output=True)
 
+async def ensure_headers(reader, initial_data=b""):
+    """Reads from reader until double newline is found, ensuring full headers."""
+    data = initial_data
+    while True:
+        if b'\r\n\r\n' in data or b'\n\n' in data:
+            return data
+        
+        try:
+            chunk = await reader.read(8192)
+        except Exception:
+            chunk = None
+            
+        if not chunk:
+            return data
+        data += chunk
+
 def modify_request(request_data, host_label):
     try:
         # Detect separator
@@ -98,7 +114,10 @@ async def handle_standard_http(reader, writer, initial_data):
     req_task = None
     
     try:
-        request_text = initial_data.decode(errors='ignore')
+        # Ensure we have full headers before parsing/modifying
+        full_data = await ensure_headers(reader, initial_data)
+        
+        request_text = full_data.decode(errors='ignore')
         lines = request_text.split('\n') # Simple split for first line
         first_line = lines[0].strip()
         
@@ -131,7 +150,7 @@ async def handle_standard_http(reader, writer, initial_data):
             logger.error("Could not determine target host.")
             return
 
-        payload = modify_request(initial_data, f"{host}:{port}")
+        payload = modify_request(full_data, f"{host}:{port}")
         
         # Establish connection
         dest_reader, dest_writer = await asyncio.open_connection(host, port)
@@ -206,7 +225,7 @@ async def handle_client(reader, writer):
             ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
             reader = await writer.start_tls(ssl_ctx)
 
-            inner_data = await reader.read(8192)
+            inner_data = await ensure_headers(reader)
             payload = modify_request(inner_data, target)
 
             d_reader, d_writer = await asyncio.open_connection(host, int(port), ssl=True)
