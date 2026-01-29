@@ -88,18 +88,24 @@ async def handle_connect(reader, writer, first_line):
         # 1. Send 200 Connection Established
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
+        logger.info(f"Sent 200 Connection Established to {target}")
         
         # 2. Upgrade to SSL (MITM)
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
         
+        logger.info("Starting TLS handshake...")
         # This requires Python 3.11+
         new_reader = await writer.start_tls(ssl_ctx)
+        logger.info("TLS handshake successful. Reading decrypted request...")
         
         # 3. Read the encrypted request (now decrypted)
         initial_data = await new_reader.read(8192)
         if not initial_data:
+            logger.warning("No data received after TLS handshake")
             return
+
+        logger.info(f"Decrypted {len(initial_data)} bytes. First line: {initial_data.split(b'\n')[0]}")
 
         # 4. Handle as standard HTTP request, but upstream is HTTPS
         await handle_http(new_reader, writer, initial_data, scheme="https", target_host=host)
@@ -158,9 +164,16 @@ async def handle_http(reader, writer, initial_data, scheme="http", target_host=N
         is_presigned = "Signature=" in url or "X-Amz-Signature=" in url
         
         if is_presigned:
+            logger.info(f"Presigned URL detected: {url}")
             if 'authorization' in headers:
+                logger.info("Stripping Authorization header")
                 del headers['authorization']
-                # logger.info(f"{Colors.CYAN}Stripped Auth for presigned URL{Colors.RESET}")
+            else:
+                logger.info("No Authorization header found to strip")
+        else:
+            # Debug: Log why we didn't think it was presigned if it looks suspicious
+            if "Signature" in url or "Amz" in url:
+                 logger.debug(f"URL has Signature-like terms but check failed? URL: {url}")
 
         # 3. Prepare Upstream Request
         # Remove hop-by-hop headers
