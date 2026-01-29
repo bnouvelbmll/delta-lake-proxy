@@ -202,41 +202,46 @@ async def handle_http(reader, writer, initial_data):
                 
                 # 5. Send Response to Client
                 # Status Line
-                status_line = f"HTTP/1.1 {resp.status} {resp.reason}\r\n"
+                reason = resp.reason if resp.reason else "OK"
+                status_line = f"HTTP/1.1 {resp.status} {reason}\r\n"
                 writer.write(status_line.encode())
                 
                 # Headers
                 # Filter hop-by-hop
                 for k, v in resp.headers.items():
-                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding']:
+                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding', 'keep-alive', 'proxy-connection']:
                         writer.write(f"{k}: {v}\r\n".encode())
                 
                 # Explicitly handle Content-Encoding
-                # Since auto_decompress=False, we forward the raw bytes.
-                # We MUST forward the Content-Encoding header if present so the client knows to decompress.
                 if 'Content-Encoding' in resp.headers:
                     writer.write(f"Content-Encoding: {resp.headers['Content-Encoding']}\r\n".encode())
+
+                # Force Connection: close to avoid Keep-Alive complexity and ensure client knows when body ends
+                writer.write(b"Connection: close\r\n")
 
                 writer.write(b"\r\n")
                 await writer.drain()
                 
                 # Body
-                async for chunk in resp.content.iter_chunked(8192):
-                    writer.write(chunk)
-                    await writer.drain()
+                try:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        writer.write(chunk)
+                        await writer.drain()
+                except Exception as e:
+                    logger.error(f"Error streaming response body: {e}")
+                    raise e
                 
                 duration = (time.time() - start_time) * 1000
                 log_request(method, url, resp.status, duration)
 
     except Exception as e:
         logger.error(f"HTTP Proxy Error: {e}")
-        try:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            await writer.drain()
-        except:
-            pass
+        # Only try to send error if headers haven't been sent? 
+        # Hard to know state here easily without a flag, but safe to try or just close.
+        pass
     finally:
         writer.close()
+        # await writer.wait_closed() # Optional but good practice
 
 async def handle_client(reader, writer):
     try:
