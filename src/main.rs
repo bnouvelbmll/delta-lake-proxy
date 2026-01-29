@@ -1481,7 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_head_request_on_bucket() {
-        let mut server = mockito::Server::new_async().await;
+        let server = mockito::Server::new_async().await;
         let s3_endpoint = server.url();
 
         let state = Arc::new(test_app_state(&s3_endpoint).await);
@@ -1544,7 +1544,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_head_request_non_existent_table() {
-        let mut server = mockito::Server::new_async().await;
+        let server = mockito::Server::new_async().await;
         let s3_endpoint = server.url();
 
         let state = Arc::new(test_app_state(&s3_endpoint).await);
