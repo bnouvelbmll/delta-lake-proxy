@@ -2,12 +2,15 @@ import asyncio
 import logging
 import time
 import ssl
-from urllib.parse import urlparse
-from aiohttp import ClientSession, TCPConnector
+import subprocess
+import os
+from aiohttp import ClientSession
 
 # --- CONFIGURATION ---
 PROXY_PORT = 28080
 LOG_LEVEL = logging.INFO
+CA_CERT = "proxy_ca.crt"
+CA_KEY = "proxy_ca.key"
 
 # --- COLORS ---
 class Colors:
@@ -27,6 +30,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Proxy")
 
+def ensure_ca():
+    if not os.path.exists(CA_CERT) or not os.path.exists(CA_KEY):
+        logger.info("Generating new MITM CA certificates...")
+        # This requires openssl to be installed
+        try:
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", CA_KEY, "-out", CA_CERT,
+                "-days", "365", "-nodes",
+                "-subj", "/CN=Spark-Proxy-CA"
+            ], check=True, capture_output=True)
+        except Exception as e:
+            logger.error(f"Failed to generate CA certs: {e}")
+
 def log_request(method, url, status, duration_ms, is_connect=False):
     color = Colors.GREEN
     if status >= 400: color = Colors.YELLOW
@@ -40,18 +57,6 @@ def log_request(method, url, status, duration_ms, is_connect=False):
         f"{color}{status}{Colors.RESET} "
         f"({duration_ms:.2f}ms)"
     )
-
-async def pipe_stream(reader, writer):
-    """Pipes data from reader to writer until reader is closed."""
-    try:
-        while True:
-            data = await reader.read(8192)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    except Exception:
-        pass
 
 async def ensure_headers(reader):
     """Reads from reader until double newline is found, ensuring full headers."""
@@ -67,17 +72,8 @@ async def ensure_headers(reader):
         except Exception:
             return data
 
-def parse_headers(header_text):
-    headers = {}
-    lines = header_text.split('\n')
-    for line in lines[1:]: # Skip request line
-        if ':' in line:
-            key, value = line.split(':', 1)
-            headers[key.strip()] = value.strip()
-    return headers
-
 async def handle_connect(reader, writer, first_line):
-    """Handles HTTPS CONNECT tunneling."""
+    """Handles HTTPS CONNECT tunneling with MITM."""
     start_time = time.time()
     target = first_line.split(' ')[1]
     try:
@@ -89,42 +85,46 @@ async def handle_connect(reader, writer, first_line):
         return
 
     try:
-        # Connect to upstream
-        upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
-        
-        # Send 200 Connection Established
+        # 1. Send 200 Connection Established
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         
-        # Pipe data
-        await asyncio.gather(
-            pipe_stream(reader, upstream_writer),
-            pipe_stream(upstream_reader, writer)
-        )
+        # 2. Upgrade to SSL (MITM)
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
         
-        upstream_writer.close()
+        # This requires Python 3.11+
+        new_reader = await writer.start_tls(ssl_ctx)
+        
+        # 3. Read the encrypted request (now decrypted)
+        initial_data = await new_reader.read(8192)
+        if not initial_data:
+            return
+
+        # 4. Handle as standard HTTP request, but upstream is HTTPS
+        await handle_http(new_reader, writer, initial_data, scheme="https", target_host=host)
+        
     except Exception as e:
-        logger.error(f"CONNECT error to {target}: {e}")
+        logger.error(f"MITM CONNECT error to {target}: {e}")
+        writer.close()
     finally:
         duration = (time.time() - start_time) * 1000
         log_request("CONNECT", target, 200, duration, is_connect=True)
-        writer.close()
+        # writer.close() is handled in handle_http usually, but if we crash here:
+        if not writer.is_closing():
+            writer.close()
 
-async def handle_http(reader, writer, initial_data):
+async def handle_http(reader, writer, initial_data, scheme="http", target_host=None):
     """Handles standard HTTP requests using aiohttp for upstream fetching."""
     start_time = time.time()
     
     # 1. Parse Request
-    # full_data = await ensure_headers(reader) # REMOVED: This was consuming data incorrectly
-    
-    # Correct logic: We have initial_data. We check if it has headers. If not, read more.
     header_bytes = initial_data
     while b'\r\n\r\n' not in header_bytes and b'\n\n' not in header_bytes:
         chunk = await reader.read(8192)
         if not chunk: break
         header_bytes += chunk
     
-    # Split headers and body (if any)
     if b'\r\n\r\n' in header_bytes:
         sep = b'\r\n\r\n'
     elif b'\n\n' in header_bytes:
@@ -151,10 +151,12 @@ async def handle_http(reader, writer, initial_data):
         for line in lines[1:]:
             if ':' in line:
                 k, v = line.split(':', 1)
-                headers[k.strip().lower()] = v.strip() # Lowercase keys
+                headers[k.strip().lower()] = v.strip()
 
         # 2. Identify Presigned & Strip Auth
+        # Check both URL and headers for signs of presigning
         is_presigned = "Signature=" in url or "X-Amz-Signature=" in url
+        
         if is_presigned:
             if 'authorization' in headers:
                 del headers['authorization']
@@ -166,21 +168,19 @@ async def handle_http(reader, writer, initial_data):
             if h in headers:
                 del headers[h]
 
-        # If URL is just path, try to find Host
+        # Construct Full URL
         if url.startswith('/'):
-            if 'host' in headers:
-                url = f"http://{headers['host']}{url}"
-            else:
-                # Fallback or error
-                pass
+            # Relative path, need host
+            host = headers.get('host', target_host)
+            if not host:
+                logger.error("No Host header and no target_host")
+                return
+            url = f"{scheme}://{host}{url}"
+        else:
+            # Absolute URL (e.g. http://host/path)
+            # If scheme is different, we might need to adjust, but usually it matches
+            pass
 
-        # Read remaining body if Content-Length indicates so
-        # For simplicity in this proxy, we might just read what's available or rely on aiohttp to stream?
-        # But we need to provide data to aiohttp.
-        # If there is a body, we should read it.
-        # For now, let's assume small bodies or just what we have. 
-        # Ideally we should stream the body from `reader` to `aiohttp`.
-        
         async def request_body_stream():
             if body_part:
                 yield body_part
@@ -190,7 +190,6 @@ async def handle_http(reader, writer, initial_data):
                 yield chunk
 
         # 4. Execute Request via aiohttp
-        # auto_decompress=False is CRITICAL for 206 ranges and binary integrity
         async with ClientSession(auto_decompress=False) as session:
             async with session.request(
                 method=method,
@@ -201,28 +200,21 @@ async def handle_http(reader, writer, initial_data):
             ) as resp:
                 
                 # 5. Send Response to Client
-                # Status Line
                 reason = resp.reason if resp.reason else "OK"
                 status_line = f"HTTP/1.1 {resp.status} {reason}\r\n"
                 writer.write(status_line.encode())
                 
-                # Headers
-                # Filter hop-by-hop
                 for k, v in resp.headers.items():
                     if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding', 'keep-alive', 'proxy-connection']:
                         writer.write(f"{k}: {v}\r\n".encode())
                 
-                # Explicitly handle Content-Encoding
                 if 'Content-Encoding' in resp.headers:
                     writer.write(f"Content-Encoding: {resp.headers['Content-Encoding']}\r\n".encode())
 
-                # Force Connection: close to avoid Keep-Alive complexity and ensure client knows when body ends
                 writer.write(b"Connection: close\r\n")
-
                 writer.write(b"\r\n")
                 await writer.drain()
                 
-                # Body
                 try:
                     async for chunk in resp.content.iter_chunked(8192):
                         writer.write(chunk)
@@ -236,16 +228,11 @@ async def handle_http(reader, writer, initial_data):
 
     except Exception as e:
         logger.error(f"HTTP Proxy Error: {e}")
-        # Only try to send error if headers haven't been sent? 
-        # Hard to know state here easily without a flag, but safe to try or just close.
-        pass
     finally:
         writer.close()
-        # await writer.wait_closed() # Optional but good practice
 
 async def handle_client(reader, writer):
     try:
-        # Peek at the first chunk to determine protocol
         initial_data = await reader.read(8192)
         if not initial_data:
             writer.close()
@@ -259,7 +246,6 @@ async def handle_client(reader, writer):
             else:
                 await handle_http(reader, writer, initial_data)
         else:
-            # Fallback or malformed
             writer.close()
             
     except Exception as e:
@@ -267,9 +253,10 @@ async def handle_client(reader, writer):
         writer.close()
 
 async def main():
+    ensure_ca()
     server = await asyncio.start_server(handle_client, '0.0.0.0', PROXY_PORT)
     print(f"{Colors.GREEN}Async Proxy Active on port {PROXY_PORT}{Colors.RESET}")
-    print(f"{Colors.CYAN}Features: CONNECT support, Presigned Auth Stripping, 206/Binary Safe{Colors.RESET}")
+    print(f"{Colors.CYAN}Features: MITM SSL, Presigned Auth Stripping, 206/Binary Safe{Colors.RESET}")
     
     async with server:
         await server.serve_forever()
