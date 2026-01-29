@@ -115,11 +115,7 @@ async def handle_http(reader, writer, initial_data):
     start_time = time.time()
     
     # 1. Parse Request
-    full_data = await ensure_headers(reader)
-    # Prepend initial_data if ensure_headers didn't include it (it reads *more*, so we need to combine carefully)
-    # Actually ensure_headers logic above assumes it starts reading from scratch. 
-    # But we already read initial_data in handle_client.
-    # Let's fix ensure_headers usage or logic.
+    # full_data = await ensure_headers(reader) # REMOVED: This was consuming data incorrectly
     
     # Correct logic: We have initial_data. We check if it has headers. If not, read more.
     header_bytes = initial_data
@@ -150,30 +146,30 @@ async def handle_http(reader, writer, initial_data):
         req_line = lines[0]
         method, url, _ = req_line.split(' ', 2)
         
-        # Parse headers
+        # Parse headers (Case-Insensitive Keys)
         headers = {}
         for line in lines[1:]:
             if ':' in line:
                 k, v = line.split(':', 1)
-                headers[k.strip()] = v.strip()
+                headers[k.strip().lower()] = v.strip() # Lowercase keys
 
         # 2. Identify Presigned & Strip Auth
         is_presigned = "Signature=" in url or "X-Amz-Signature=" in url
         if is_presigned:
-            if 'Authorization' in headers:
-                del headers['Authorization']
+            if 'authorization' in headers:
+                del headers['authorization']
                 # logger.info(f"{Colors.CYAN}Stripped Auth for presigned URL{Colors.RESET}")
 
         # 3. Prepare Upstream Request
         # Remove hop-by-hop headers
-        for h in ['Proxy-Connection', 'Connection', 'Keep-Alive', 'Transfer-Encoding', 'Host']:
+        for h in ['proxy-connection', 'connection', 'keep-alive', 'transfer-encoding', 'host']:
             if h in headers:
                 del headers[h]
 
         # If URL is just path, try to find Host
         if url.startswith('/'):
-            if 'Host' in headers:
-                url = f"http://{headers['Host']}{url}"
+            if 'host' in headers:
+                url = f"http://{headers['host']}{url}"
             else:
                 # Fallback or error
                 pass
