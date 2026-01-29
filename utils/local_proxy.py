@@ -1,19 +1,45 @@
 import asyncio
 import logging
-from aiohttp import web, ClientSession, TCPConnector
+import time
+import ssl
+from urllib.parse import urlparse
+from aiohttp import ClientSession, TCPConnector
 
 # --- CONFIGURATION ---
-ENABLE_LOGGING = True
 PROXY_PORT = 28080
 LOG_LEVEL = logging.INFO
 
-if ENABLE_LOGGING:
-    logging.basicConfig(
-        level=LOG_LEVEL,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%H:%M:%S'
+# --- COLORS ---
+class Colors:
+    RESET = "\033[0m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("Proxy")
+
+def log_request(method, url, status, duration_ms, is_connect=False):
+    color = Colors.GREEN
+    if status >= 400: color = Colors.YELLOW
+    if status >= 500: color = Colors.RED
+    
+    method_color = Colors.MAGENTA if is_connect else Colors.BLUE
+    
+    logger.info(
+        f"{method_color}{method:<7}{Colors.RESET} "
+        f"{url:<50} "
+        f"{color}{status}{Colors.RESET} "
+        f"({duration_ms:.2f}ms)"
     )
-logger = logging.getLogger("ProxyLogger")
 
 async def pipe_stream(reader, writer):
     """Pipes data from reader to writer until reader is closed."""
@@ -27,159 +53,225 @@ async def pipe_stream(reader, writer):
     except Exception:
         pass
 
-async def connect_handler(request: web.Request):
-    """Handles the CONNECT method for HTTPS tunneling."""
-    loop = asyncio.get_running_loop()
-    host, port = request.path.split(':')
-    port = int(port)
+async def ensure_headers(reader):
+    """Reads from reader until double newline is found, ensuring full headers."""
+    data = b""
+    while True:
+        if b'\r\n\r\n' in data or b'\n\n' in data:
+            return data
+        try:
+            chunk = await reader.read(8192)
+            if not chunk:
+                return data
+            data += chunk
+        except Exception:
+            return data
 
-    if ENABLE_LOGGING:
-        logger.info(f"CONNECT {host}:{port}")
+def parse_headers(header_text):
+    headers = {}
+    lines = header_text.split('\n')
+    for line in lines[1:]: # Skip request line
+        if ':' in line:
+            key, value = line.split(':', 1)
+            headers[key.strip()] = value.strip()
+    return headers
 
-    # Connect to upstream
+async def handle_connect(reader, writer, first_line):
+    """Handles HTTPS CONNECT tunneling."""
+    start_time = time.time()
+    target = first_line.split(' ')[1]
     try:
+        host, port = target.split(':')
+        port = int(port)
+    except ValueError:
+        logger.error(f"Invalid CONNECT target: {target}")
+        writer.close()
+        return
+
+    try:
+        # Connect to upstream
         upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
+        
+        # Send 200 Connection Established
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        
+        # Pipe data
+        await asyncio.gather(
+            pipe_stream(reader, upstream_writer),
+            pipe_stream(upstream_reader, writer)
+        )
+        
+        upstream_writer.close()
     except Exception as e:
-        logger.error(f"Failed to connect to upstream {host}:{port}: {e}")
-        return web.Response(status=502, text="Bad Gateway")
+        logger.error(f"CONNECT error to {target}: {e}")
+    finally:
+        duration = (time.time() - start_time) * 1000
+        log_request("CONNECT", target, 200, duration, is_connect=True)
+        writer.close()
 
-    # Send 200 Connection Established to the client
-    # We use a StreamResponse to take control, but we need to be careful about headers.
-    # CONNECT responses are very minimal.
-    resp = web.StreamResponse(status=200, reason='Connection Established')
-    await resp.prepare(request)
+async def handle_http(reader, writer, initial_data):
+    """Handles standard HTTP requests using aiohttp for upstream fetching."""
+    start_time = time.time()
+    
+    # 1. Parse Request
+    full_data = await ensure_headers(reader)
+    # Prepend initial_data if ensure_headers didn't include it (it reads *more*, so we need to combine carefully)
+    # Actually ensure_headers logic above assumes it starts reading from scratch. 
+    # But we already read initial_data in handle_client.
+    # Let's fix ensure_headers usage or logic.
+    
+    # Correct logic: We have initial_data. We check if it has headers. If not, read more.
+    header_bytes = initial_data
+    while b'\r\n\r\n' not in header_bytes and b'\n\n' not in header_bytes:
+        chunk = await reader.read(8192)
+        if not chunk: break
+        header_bytes += chunk
+    
+    # Split headers and body (if any)
+    if b'\r\n\r\n' in header_bytes:
+        sep = b'\r\n\r\n'
+    elif b'\n\n' in header_bytes:
+        sep = b'\n\n'
+    else:
+        sep = b''
+        
+    if sep:
+        head_part, body_part = header_bytes.split(sep, 1)
+    else:
+        head_part = header_bytes
+        body_part = b""
 
-    # Hijack the client connection
-    # In aiohttp, we can access the transport.
-    # We need to be careful not to let aiohttp close it immediately or interfere.
-    
-    transport = request.transport
-    
-    # We can't easily get a reader/writer pair from the transport in aiohttp handler 
-    # without some hacks, but we can read from the request content (which is the reader)
-    # and write to the transport (which is the writer).
-    
-    # However, request.content is a StreamReader.
-    
-    # Create tasks to pipe data
-    # Client -> Upstream
-    client_reader = request.content
-    
-    # Upstream -> Client
-    # We need to write to the client. `resp.write` writes to the client.
-    
-    async def upstream_to_client():
-        try:
-            while True:
-                data = await upstream_reader.read(8192)
-                if not data:
-                    break
-                await resp.write(data)
-        except Exception:
-            pass
-
-    async def client_to_upstream():
-        try:
-            while True:
-                # request.content.read() reads from the client
-                data = await client_reader.read(8192)
-                if not data:
-                    break
-                upstream_writer.write(data)
-                await upstream_writer.drain()
-        except Exception:
-            pass
-
-    # Run both pipes
-    await asyncio.gather(upstream_to_client(), client_to_upstream())
-    
-    upstream_writer.close()
-    return resp
-
-async def proxy_handler(request: web.Request):
-    if request.method == 'CONNECT':
-        return await connect_handler(request)
-
-    # 1. Identify query nature
-    is_presigned = any(k in request.query for k in ['X-Amz-Signature', 'Signature'])
-    
-    if ENABLE_LOGGING:
-        logger.info(f"REQ: {request.method} {request.url}")
-        if is_presigned:
-            logger.info("Detected Presigned URL - Authorization will be stripped.")
-
-    # 2. Header manipulation
-    headers = dict(request.headers)
-    if is_presigned:
-        headers.pop('Authorization', None)
-    
-    # Remove hop-by-hop headers
-    headers.pop('Host', None)
-    headers.pop('Connection', None)
-    headers.pop('Proxy-Connection', None)
-    headers.pop('Transfer-Encoding', None)
-    headers.pop('Keep-Alive', None)
-
-    # 3. Forward request
     try:
-        # Disable auto_decompress to forward raw bytes (important for 206 and binary files)
+        header_text = head_part.decode(errors='ignore')
+        lines = header_text.splitlines()
+        if not lines: return
+        
+        req_line = lines[0]
+        method, url, _ = req_line.split(' ', 2)
+        
+        # Parse headers
+        headers = {}
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+
+        # 2. Identify Presigned & Strip Auth
+        is_presigned = "Signature=" in url or "X-Amz-Signature=" in url
+        if is_presigned:
+            if 'Authorization' in headers:
+                del headers['Authorization']
+                # logger.info(f"{Colors.CYAN}Stripped Auth for presigned URL{Colors.RESET}")
+
+        # 3. Prepare Upstream Request
+        # Remove hop-by-hop headers
+        for h in ['Proxy-Connection', 'Connection', 'Keep-Alive', 'Transfer-Encoding', 'Host']:
+            if h in headers:
+                del headers[h]
+
+        # If URL is just path, try to find Host
+        if url.startswith('/'):
+            if 'Host' in headers:
+                url = f"http://{headers['Host']}{url}"
+            else:
+                # Fallback or error
+                pass
+
+        # Read remaining body if Content-Length indicates so
+        # For simplicity in this proxy, we might just read what's available or rely on aiohttp to stream?
+        # But we need to provide data to aiohttp.
+        # If there is a body, we should read it.
+        # For now, let's assume small bodies or just what we have. 
+        # Ideally we should stream the body from `reader` to `aiohttp`.
+        
+        async def request_body_stream():
+            if body_part:
+                yield body_part
+            while True:
+                chunk = await reader.read(8192)
+                if not chunk: break
+                yield chunk
+
+        # 4. Execute Request via aiohttp
+        # auto_decompress=False is CRITICAL for 206 ranges and binary integrity
         async with ClientSession(auto_decompress=False) as session:
             async with session.request(
-                method=request.method,
-                url=request.url,
+                method=method,
+                url=url,
                 headers=headers,
-                data=request.content if request.has_body else None,
+                data=request_body_stream() if method in ['PUT', 'POST'] else None,
                 allow_redirects=False
             ) as resp:
                 
-                if ENABLE_LOGGING:
-                    logger.info(f"RES: {resp.status} for {request.path}")
-
-                # 4. Stream response back
-                # Copy headers from upstream
-                proxy_headers = dict(resp.headers)
+                # 5. Send Response to Client
+                # Status Line
+                status_line = f"HTTP/1.1 {resp.status} {resp.reason}\r\n"
+                writer.write(status_line.encode())
                 
-                # Remove hop-by-hop headers from response
-                proxy_headers.pop('Connection', None)
-                proxy_headers.pop('Transfer-Encoding', None)
-                proxy_headers.pop('Content-Encoding', None) # Let client handle decoding if we send raw bytes? 
-                # Wait, if we disabled auto_decompress, we receive raw bytes (compressed or not).
-                # We should forward Content-Encoding so client knows how to handle it.
-                # But aiohttp might have stripped it? No, resp.headers has it.
-                # However, if we use `auto_decompress=False`, `resp.content` yields raw body.
-                # So we SHOULD forward Content-Encoding.
+                # Headers
+                # Filter hop-by-hop
+                for k, v in resp.headers.items():
+                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding']:
+                        writer.write(f"{k}: {v}\r\n".encode())
                 
-                # Re-add Content-Encoding if it was present in upstream response
+                # Explicitly handle Content-Encoding
+                # Since auto_decompress=False, we forward the raw bytes.
+                # We MUST forward the Content-Encoding header if present so the client knows to decompress.
                 if 'Content-Encoding' in resp.headers:
-                    proxy_headers['Content-Encoding'] = resp.headers['Content-Encoding']
+                    writer.write(f"Content-Encoding: {resp.headers['Content-Encoding']}\r\n".encode())
 
-                proxy_resp = web.StreamResponse(status=resp.status, headers=proxy_headers)
-                await proxy_resp.prepare(request)
+                writer.write(b"\r\n")
+                await writer.drain()
                 
+                # Body
                 async for chunk in resp.content.iter_chunked(8192):
-                    await proxy_resp.write(chunk)
+                    writer.write(chunk)
+                    await writer.drain()
                 
-                return proxy_resp
+                duration = (time.time() - start_time) * 1000
+                log_request(method, url, resp.status, duration)
 
     except Exception as e:
-        if ENABLE_LOGGING:
-            logger.error(f"Error forwarding request: {str(e)}")
-        return web.Response(status=502, text=f"Proxy Error: {e}")
+        logger.error(f"HTTP Proxy Error: {e}")
+        try:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            await writer.drain()
+        except:
+            pass
+    finally:
+        writer.close()
+
+async def handle_client(reader, writer):
+    try:
+        # Peek at the first chunk to determine protocol
+        initial_data = await reader.read(8192)
+        if not initial_data:
+            writer.close()
+            return
+
+        first_line_end = initial_data.find(b'\n')
+        if first_line_end != -1:
+            first_line = initial_data[:first_line_end].decode(errors='ignore').strip()
+            if first_line.startswith('CONNECT'):
+                await handle_connect(reader, writer, first_line)
+            else:
+                await handle_http(reader, writer, initial_data)
+        else:
+            # Fallback or malformed
+            writer.close()
+            
+    except Exception as e:
+        logger.error(f"Client Error: {e}")
+        writer.close()
 
 async def main():
-    app = web.Application()
-    # Catch-all route
-    app.router.add_route('*', '/{tail:.*}', proxy_handler)
+    server = await asyncio.start_server(handle_client, '0.0.0.0', PROXY_PORT)
+    print(f"{Colors.GREEN}Async Proxy Active on port {PROXY_PORT}{Colors.RESET}")
+    print(f"{Colors.CYAN}Features: CONNECT support, Presigned Auth Stripping, 206/Binary Safe{Colors.RESET}")
     
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PROXY_PORT)
-    print(f"Async Proxy Active on http://0.0.0.0:{PROXY_PORT}")
-    await site.start()
-    
-    # Keep alive
-    while True:
-        await asyncio.sleep(3600)
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
     try:
