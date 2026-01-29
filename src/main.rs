@@ -140,48 +140,6 @@ async fn main() {
             .unwrap()
     });
 
-    let datalake_prefix = warp::path("datalake");
-
-    // GET eroute: handle partition-aware GET requests
-    let get_route = warp::get()
-        .and(datalake_prefix.clone())
-        .and(warp::header::optional("authorization"))
-        .and(warp::path::tail())
-        .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
-        .and(warp::header::headers_cloned())
-        .and(with_state(state.clone()))
-        .and_then(handle_get);
-
-    // Other methods: transparent proxy
-    let other_routes = warp::method()
-        .and(datalake_prefix.clone())
-        .and(warp::path::tail())
-        .and(warp::header::headers_cloned())
-        .and(warp::body::stream())
-        .and(with_state(state.clone()))
-        .and_then(|method: Method, path, headers, body, state| async move {
-            if method == Method::GET || method == Method::HEAD {
-                // If we reached here with GET/HEAD, it means the specific GET/HEAD routes failed to match.
-                // This usually happens if the query string was invalid (handled by handle_rejection now)
-                // or if some other filter failed.
-                // We should NOT process it as a proxy request.
-                // We return a rejection so that handle_rejection can pick up the original error (e.g. InvalidQuery).
-                Err(warp::reject::not_found())
-            } else {
-                proxy_to_s3(method, path, headers, body, state).await
-            }
-        });
-
-    // HEAD route: handle partition-aware HEAD requests
-    let head_route = warp::head()
-        .and(datalake_prefix.clone())
-        .and(warp::header::optional("authorization"))
-        .and(warp::path::tail())
-        .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
-        .and(warp::header::headers_cloned())
-        .and(with_state(state.clone()))
-        .and_then(handle_head_wrapper);
-
     let head_root_route = warp::path::end().and(warp::head()).map(move || {
         debug!("HEAD request for /");
         warp::http::Response::builder()
@@ -190,11 +148,24 @@ async fn main() {
             .unwrap()
     });
 
+    let datalake_route = warp::path("datalake")
+        .and(warp::method())
+        .and(warp::header::optional("authorization"))
+        .and(warp::path::tail())
+        .and(
+            warp::query::raw()
+                .map(Some)
+                .or(warp::any().map(|| None))
+                .unify(),
+        )
+        .and(warp::header::headers_cloned())
+        .and(warp::body::stream())
+        .and(with_state(state.clone()))
+        .and_then(dispatch_request);
+
     let routes = list_buckets_route
         .or(head_root_route)
-        .or(head_route)
-        .or(get_route)
-        .or(other_routes)
+        .or(datalake_route)
         .recover(handle_rejection)
         .with(warp::trace::request());
 
@@ -443,6 +414,35 @@ async fn get_allowed_files_for_table(
     state.file_list_cache.insert(cache_key, allowed_files.clone());
 
     Ok(allowed_files)
+}
+
+// ---------------------- Dispatcher ----------------------
+async fn dispatch_request(
+    method: Method,
+    auth_header: Option<String>,
+    path: warp::path::Tail,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: impl Stream<Item = Result<impl Buf, warp::Error>> + Send + Sync + 'static,
+    state: Arc<AppState>,
+) -> Result<Box<dyn Reply>, warp::Rejection> {
+    match method {
+        Method::GET => {
+            handle_get(auth_header, path, query, headers, state).await
+        }
+        Method::HEAD => {
+            handle_head_wrapper(auth_header, path, query, headers, state).await
+        }
+        Method::OPTIONS => {
+            Ok(Box::new(warp::reply::with_status(
+                "",
+                warp::http::StatusCode::OK,
+            )))
+        }
+        _ => {
+            proxy_to_s3(method, path, headers, body, state).await
+        }
+    }
 }
 
 // ---------------------- Handle GET ----------------------
@@ -1428,45 +1428,22 @@ mod tests {
             .create();
 
         let state = Arc::new(test_app_state(&s3_endpoint).await);
-        let datalake_prefix = warp::path("datalake");
-
-        // Define routes similar to main() to test routing logic
-        let head_route = warp::head()
-            .and(datalake_prefix.clone())
+        
+        // New routing pattern
+        let routes = warp::path("datalake")
+            .and(warp::method())
             .and(warp::header::optional("authorization"))
             .and(warp::path::tail())
-            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
-            .and(warp::header::headers_cloned())
-            .and(with_state(state.clone()))
-            .and_then(handle_head_wrapper);
-
-        let get_route = warp::get()
-            .and(datalake_prefix.clone())
-            .and(warp::header::optional("authorization"))
-            .and(warp::path::tail())
-            .and(warp::query::raw().map(Some).or(warp::any().map(|| None)).unify())
-            .and(warp::header::headers_cloned())
-            .and(with_state(state.clone()))
-            .and_then(handle_get);
-
-        let other_routes = warp::method()
-            .and_then(|method: Method| async move {
-                if method == Method::GET || method == Method::HEAD {
-                    Err(warp::reject())
-                } else {
-                    Ok(method)
-                }
-            })
-            .and(datalake_prefix.clone())
-            .and(warp::path::tail())
+            .and(
+                warp::query::raw()
+                    .map(Some)
+                    .or(warp::any().map(|| None))
+                    .unify(),
+            )
             .and(warp::header::headers_cloned())
             .and(warp::body::stream())
             .and(with_state(state.clone()))
-            .and_then(|method, path, headers, body, state| {
-                proxy_to_s3(method, path, headers, body, state)
-            });
-        
-        let routes = head_route.or(get_route).or(other_routes);
+            .and_then(dispatch_request);
 
         let res = request()
             .method("HEAD")
