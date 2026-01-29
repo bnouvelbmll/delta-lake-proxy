@@ -1,5 +1,5 @@
 {
-  "table_mapping": {
+  "tableMapping": {
     "trades_plus": "s3://bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/tables/d4d07a86-b88b-444c-985a-bb7659caacd6",
     "reference": "s3://bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/tables/553e09ba-507f-4cde-955e-898502567306"
   },
