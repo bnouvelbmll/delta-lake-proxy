@@ -204,7 +204,7 @@ async def handle_client(reader, writer):
 
             ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ssl_ctx.load_cert_chain(CA_CERT, CA_KEY)
-            await writer.start_tls(ssl_ctx)
+            reader = await writer.start_tls(ssl_ctx)
 
             inner_data = await reader.read(8192)
             payload = modify_request(inner_data, target)
