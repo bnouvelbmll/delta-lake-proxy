@@ -279,6 +279,9 @@ async fn proxy_s3_list(
             write!(&mut xml, "<KeyCount>{}</KeyCount>", output.key_count.unwrap_or(0)).unwrap();
             write!(&mut xml, "<MaxKeys>{}</MaxKeys>", output.max_keys.unwrap_or(1000)).unwrap();
             write!(&mut xml, "<IsTruncated>{}</IsTruncated>", output.is_truncated.unwrap_or(false)).unwrap();
+            if let Some(token) = output.next_continuation_token() {
+                write!(&mut xml, "<NextContinuationToken>{}</NextContinuationToken>", escape_xml(token)).unwrap();
+            }
 
             for object in output.contents() {
                 if let Some(key) = object.key() {
@@ -768,6 +771,13 @@ async fn proxy_s3_get(
             error!("S3 GET error: {:?}", err);
             if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
                 error!("S3 Upstream response: {:?}", service_err.raw());
+                if service_err.err().is_no_such_key() {
+                    return Ok(warp::reply::with_status(
+                        "Not Found",
+                        warp::http::StatusCode::NOT_FOUND,
+                    )
+                    .into_response());
+                }
             }
             Ok(warp::reply::with_status(
                 "S3 GET error",
@@ -816,6 +826,13 @@ async fn proxy_s3_head(
             error!("S3 HEAD error: {:?}", err);
             if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &err {
                 error!("S3 Upstream response: {:?}", service_err.raw());
+                if service_err.err().is_not_found() {
+                    return Ok(warp::reply::with_status(
+                        "Not Found",
+                        warp::http::StatusCode::NOT_FOUND,
+                    )
+                    .into_response());
+                }
             }
             Ok(warp::reply::with_status(
                 "S3 HEAD error",
@@ -1577,6 +1594,6 @@ mod tests {
             .reply(&routes)
             .await;
 
-        assert_eq!(res.status(), 500, "HEAD request on non-existent file should return 500");
+        assert_eq!(res.status(), 404, "HEAD request on non-existent file should return 404");
     }
 }
