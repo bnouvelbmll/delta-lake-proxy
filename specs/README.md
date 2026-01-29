@@ -36,7 +36,7 @@ The proxy must emulate a subset of the AWS S3 API to ensure compatibility with s
 To optimize performance and cost, the proxy supports two modes for `GET` requests:
 
 1.  **Proxy Mode**: The proxy streams the file content from S3 to the client. The client sees the proxy as the source of truth.
-2.  **Presigned URL Mode (Redirect)**: The proxy generates a temporary, pre-signed S3 URL and redirects the client (HTTP 307) to fetch the data directly from S3. This offloads bandwidth from the proxy.
+2.  **Presigned URL Mode (Redirect)**: The proxy generates a temporary, pre-signed S3 URL and redirects the client (HTTP 307) to fetch the data directly from S3. This offloads bandwidth from the proxy. When using this mode, a client-side proxy (like the `local_proxy.py`) is recommended to manage headers during the redirect, specifically stripping all but the `Range` header to avoid S3 errors.
     *   *Exception*: Partial content requests (Range headers) can be configured to always use Proxy Mode (`proxyPartial: true`) to ensure correct behavior if the client doesn't handle redirects for partial content well.
 
 ### 2.5 Observability
@@ -179,6 +179,6 @@ The application is configured via `config.json`.
 ## 6. Client-Side Utilities
 
 ### 6.1 Local Auth Proxy
-To address issues where clients (like Spark) incorrectly forward AWS IAM `Authorization` headers to pre-signed S3 URLs (causing S3 to reject the request), a local Python proxy is available.
+To address issues where clients (like Spark) incorrectly forward AWS IAM `Authorization` headers to pre-signed S3 URLs (causing S3 to reject the request), a local Python proxy is available. This proxy intercepts redirects and, when following them, it preserves only the `Range` header (if present) and removes all other headers to ensure compatibility with S3.
 
 See [Client-Side Auth Proxy Specification](client_proxy.md) for details.

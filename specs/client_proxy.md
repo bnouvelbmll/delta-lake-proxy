@@ -26,7 +26,7 @@ graph LR
     Client[Spark / Client App] -- 1. Request + Auth Header --> LocalProxy[Local Python Proxy]
     LocalProxy -- 2. Forward Request + Auth Header --> DeltaProxy[Delta Lake Proxy]
     DeltaProxy -- 3. 307 Redirect (Presigned URL) --> LocalProxy
-    LocalProxy -- 4. Follow Redirect (Strip Auth Header) --> S3[Amazon S3]
+    LocalProxy --> 4. Follow Redirect (Manage Headers) --> S3[Amazon S3]
     S3 -- 5. Data Stream --> LocalProxy
     LocalProxy -- 6. Data Stream --> Client
 ```
@@ -40,7 +40,7 @@ graph LR
     *   The `Local Python Proxy` intercepts this response.
 4.  **Header Stripping & Fetching**:
     *   The `Local Python Proxy` follows the redirect to S3.
-    *   **Crucially**, it **removes** the `Authorization` header before making the request to S3. The pre-signed URL itself provides the necessary authorization.
+    *   **Crucially**, it **removes all headers except the `Range` header** (if present) before making the request to S3. The pre-signed URL itself provides the necessary authorization.
 5.  **Streaming Response**: The `Local Python Proxy` streams the response body from S3 back to the Client.
 
 ### 2.3 Implementation Details
@@ -53,9 +53,9 @@ graph LR
         *   Construct the upstream URL (Delta Proxy).
         *   Forward the request method, headers, and body.
         *   Check the response status.
-        *   If `307` (or `301`/`302`) AND the location is an S3 URL:
+        *   If `307` (or `301`/`302`/`303`/`308`) AND the location is an S3 URL:
             *   Make a new request to the redirect location.
-            *   **Exclude** the `Authorization` header.
+            *   **Exclude all headers except `Range`** (if present).
             *   Stream the result back to the client.
         *   Else:
             *   Stream the response directly back to the client.
