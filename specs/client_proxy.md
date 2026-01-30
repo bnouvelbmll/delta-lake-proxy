@@ -23,12 +23,24 @@ This proxy runs locally on the client's machine (or sidecar) and acts as a middl
 
 ```mermaid
 graph LR
-    Client[Spark / Client App] -- 1. Request + Auth Header --> LocalProxy[Local Python Proxy]
-    LocalProxy -- 2. Forward Request + Auth Header --> DeltaProxy[Delta Lake Proxy]
-    DeltaProxy -- 3. 307 Redirect (Presigned URL) --> LocalProxy
-    LocalProxy --> 4. Follow Redirect (Manage Headers) --> S3[Amazon S3]
-    S3 -- 5. Data Stream --> LocalProxy
-    LocalProxy -- 6. Data Stream --> Client
+    subgraph "Client Side [BMLL DATA LAB]"
+        Client[Spark / Client App]
+        LocalProxy[Local Python Proxy =Redirect Comptatibility=]
+    end
+
+    subgraph "Server Side  AWS US-EAST-1]"
+	DeltaProxy[Delta Lake Proxy =Permissionning Logic=]
+        S3[Amazon S3]
+    end
+
+    Client -- "1. Request + Auth Header" --> LocalProxy
+    LocalProxy -- "2. Forward Request + Auth Header" --> DeltaProxy
+    DeltaProxy -. "3. Generate presigned url" -.- S3
+    DeltaProxy -- "4. 307 Redirect (Presigned URL)" --> LocalProxy  
+    LocalProxy -- "5. Follow Redirect (Manage Headers)" --> S3
+    S3 -- "6. Data Stream" --> LocalProxy
+    LocalProxy -- "7. Data Stream" --> Client
+    
 ```
 
 ### 2.2 Workflow
@@ -71,12 +83,14 @@ sequenceDiagram
 
     Client->>LocalProxy: GET /datalake/table/file.parquet (Auth: AWS4-HMAC...)
     LocalProxy->>DeltaProxy: GET /datalake/table/file.parquet (Auth: AWS4-HMAC...)
+    DeltaProxy->>S3: Request Presigned URL
+    S3-->>DeltaProxy: Return Presigned URL
     DeltaProxy-->>LocalProxy: 307 Redirect (Location: https://s3.../file.parquet?Signature=...)
     
     Note over LocalProxy: Intercept 307. Detect S3 Target.
     
     LocalProxy->>S3: GET https://s3.../file.parquet?Signature=...
-    Note right of LocalProxy: Authorization Header REMOVED
+    Note right of LocalProxy: Authorization Header REMOVED, Range Header KEPT (if present)
     
     S3-->>LocalProxy: 200 OK (File Content)
     LocalProxy-->>Client: 200 OK (File Content)

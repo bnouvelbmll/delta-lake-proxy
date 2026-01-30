@@ -116,91 +116,11 @@ cargo test
 
 ## Validation
 
+
 Run remote proxy
 
 ```
-import os
-
-os.system("pip install deltalake")
-os.environ["RUST_LOG"]="INFO"# os.environ["HTTP_PROXY"]="http://127.0.0.1:28080"
-from pyspark.sql import SparkSession
-import boto3
-import os
-
-
-print("Stopping SPARK")
-# Stop any running Spark session
-try:
-    spark.stop()
-except Exception as e:
-    print(e)
-    pass
-print("Reconfiguring SPARK")
-
-# Get temporary credentials from boto3
-session = boto3.Session()
-creds = session.get_credentials().get_frozen_credentials()
-
-os.environ["AWS_ACCESS_KEY_ID"] = creds.access_key
-os.environ["AWS_SECRET_ACCESS_KEY"] = creds.secret_key
-os.environ["AWS_SESSION_TOKEN"] = creds.token
-# os.environ["HTTP_PROXY"] = "http://127.0.0.1:28080/"
-# os.environ["HTTPS_PROXY"] = "http://127.0.0.1:28080/"
-print("Starting SPARK")
-
-spark = (SparkSession.builder \
-    .master("local[*]") \
-    .config("spark.jars.packages",
-            "org.apache.hadoop:hadoop-aws:3.3.4,org.apache.hadoop:aws-java-sdk-bundle:1.12.262") \
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-    .config("spark.hadoop.fs.s3a.access.key", creds.access_key) \
-    .config("spark.hadoop.fs.s3a.secret.key", creds.secret_key) \
-    .config("spark.hadoop.fs.s3a.session.token", creds.token) \
-    .config("spark.hadoop.fs.s3a.endpoint.region", "us-east-1") \
-    .config("spark.hadoop.fs.s3a.endpoint", "http://localhost:18080") \
-    .config("fs.s3a.endpoint", "http://localhost:18080") \
-    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-    .config("spark.hadoop.fs.s3a.proxy.host", "127.0.0.1") \
-    .config("spark.hadoop.fs.s3a.proxy.port", "28080") \
-    .config("fs.s3a.proxy.host", "127.0.0.1") \
-    .config("fs.s3a.proxy.port", "28080") \
-    .config("fs.s3a.proxy.ssl.enabled", "false") \
-    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
-    .config("spark.hadoop.fs.s3a.proxy.ssl.enabled", "false") \
-    .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider") \
-     .config( "spark.sql.extensions","io.delta.sql.DeltaSparkSessionExtension") \
-    .config("com.amazonaws.sdk.disableCertChecking","true") \
-    .config("spark.hadoop.fs.s3a.ssl.channel.mode","insecure")
-    .config ("spark.sql.catalog.spark_catalog","org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-    .getOrCreate()
-        )
-print("Loading data")
-df=spark.read.format("delta").load("s3a://datalake/trades_plus/")
-#df = spark.read.parquet("s3a://bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/tables/d4d07a86-b88b-444c-985a-bb7659caacd6/02/part-00027-69cf6606-bd2e-44dc-8edc-602ee9776132.c000.zstd.parquet")
-
-
-try:
-    dfq=df.where("MIC = 'XMIL'").limit(10)
-    print(pd.DataFrame(dfq.toLocalIterator(), columns =dfq.columns))[["Ticker","MIC","TradeTimestamp","Price","Size"]]
-except Exception as e:
-    print("XMIL",e)
-
-
-try:
-    dfq=df.where("MIC = 'XLON'").limit(10)
-    print(pd.DataFrame(dfq.toLocalIterator(), columns =dfq.columns))[["Ticker","MIC","TradeTimestamp","Price","Size"]]
-except Exception as e:
-    print("XLON",e)
-
-    
-try:
-    dfq=df.where("MIC = 'XPAR'").limit(10)
-    print(pd.DataFrame(dfq.toLocalIterator(), columns =dfq.columns))[["Ticker","MIC","TradeTimestamp","Price","Size"]]
-except Exception as e:
-    print("XPAR",e)
-
-
-import json
+%pip install deltalake
 import polars as pl
 
 from deltalake import DeltaTable
@@ -208,24 +128,6 @@ import json
 import time
 import boto3
 
-def get_mapping_and_files(table_uri, partition_filter=None, storage_options=None): 
-    # 1. Initialize the table (S3 requires storage_options) 
-    dt = DeltaTable(table_uri, storage_options=storage_options) 
-    # 2. Get the Schema Mapping # We look into the table's internal metadata for the column mapping 
-    metadata = dt.metadata() 
-    print(dir(metadata._metadata))
-    print(metadata._metadata)
-    schema_json = json.loads(metadata.schema_json) 
-    rename_map = {} 
-    for field in schema_json.get("fields", []): 
-        logical_name = field["name"] 
-        # Extract physical name from field metadata 
-        physical_name = field.get("metadata", {}).get("delta.columnMapping.physicalName") 
-        if physical_name: 
-            rename_map[physical_name] = logical_name
-     # 3. Get specific files filtered by partition # Example partition_filter: [("year", "=", "2023"), ("month", "=", "12")] 
-    active_files = dt.file_uris(partition_filters=partition_filter) 
-    return rename_map, active_files
 
 _creds = None
 _creds_time = 0
@@ -238,26 +140,7 @@ def get_creds():
         _creds_time=time.time() 
     return _creds
 
-def test_load_data( table_path = "s3:/datalake/trade_plus/",filters = [("TradeDate", "=", "2024-01-25")]):
-     # AWS Configuration 
-     creds=get_creds()
-     if table_path.startswith("s3://datalake"):
-         s3_options = { "aws_access_key_id": creds.access_key, "aws_secret_access_key": creds.secret_key, "aws_session_token": creds.token, "aws_region": "us-east-1", "aws_endpoint_url": "http://localhost:18080", "aws_s3_force_path_style": "true", "aws_allow_http": "true",
-         }
-     else:
-         s3_options = { "aws_access_key_id": creds.access_key, "aws_secret_access_key": creds.secret_key, "aws_session_token": creds.token, "aws_region": "us-east-1"}
-         
-
-     # Define your partition filter 
-     # This ensures we only fetch files from the specific S3 'folder' # 1. Get the translation map and the S3 URIs mapping, 
-     file_uris = get_mapping_and_files( table_path, partition_filter=
-                                        
-                                        filters, storage_options=s3_options )
-     # 2. Load into Polars # Polars read_parquet handles S3 URIs natively if you pass storage_options 
-     df = pl.scan_parquet(file_uris, storage_options=s3_options)
-     # 3. Apply the mapping to fix the UUID column names 
-     df = df.rename({k: v for k, v in mapping.items() if k in df.columns})
-     return df
+    
 
 def spawn_proxy():
     creds=get_creds()
@@ -271,6 +154,15 @@ Run local proxy
 
 ```
 python utils/local_proxy.py 
+```
+
+
+Install pyspark with deltas 
+
+```
+%pip install delta-spark
+!(cd  /home/bmll/.spark/jars/; wget -nd  https://repo1.maven.org/maven2/io/delta/delta-core_2.12/2.4.0/delta-core_2.12-2.4.0.jar)
+!(cd  /home/bmll/.spark/jars/; wget -nd  https://repo1.maven.org/maven2/io/delta/delta-storage/2.4.0/delta-storage-2.4.0.jar)
 ```
 
 
@@ -352,4 +244,51 @@ except Exception as e:
     print("XPAR",e)
 
 
+```
+
+### Note that column mapping and iceberg compat is not working currently on databricks
+
+```
+import os
+os.system("pip install -U deltalake")
+import polars as pl
+
+pl.scan_delta("s3://bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/tables/d4d07a86-b88b-444c-985a-bb7659caacd6/").limit(10).collect()
+
+```
+Results in 
+```
+File ~/.conda/envs/py311-stable/lib/python3.11/site-packages/polars/io/delta.py:376, in scan_delta(***failed resolving arguments***)
+    374     if len(missing_features) > 0:
+    375         msg = f"The table has set these reader features: {missing_features} but these are not yet supported by the polars delta scanner."
+--> 376         raise DeltaProtocolError(msg)
+    378 delta_schema = dl_tbl.schema()
+    379 polars_schema = Schema(delta_schema)
+
+DeltaProtocolError: The table has set these reader features: {'columnMapping'} but these are not yet supported by the polars delta scanner.
+
+```
+
+
+```
+import os
+os.system("pip install -U pyiceberg")
+import polars as pl
+
+pl.scan_iceberg("s3://bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/tables/d4d07a86-b88b-444c-985a-bb7659caacd6/")
+
+```
+
+Will result in 
+
+```
+...
+File ~/.conda/envs/py311-stable/lib/python3.11/site-packages/pyarrow/_fs.pyx:815, in pyarrow._fs.FileSystem.open_input_file()
+
+File ~/.conda/envs/py311-stable/lib/python3.11/site-packages/pyarrow/error.pxi:155, in pyarrow.lib.pyarrow_internal_check_status()
+
+File ~/.conda/envs/py311-stable/lib/python3.11/site-packages/pyarrow/error.pxi:92, in pyarrow.lib.check_status()
+
+FileNotFoundError: [Errno 2] Path does not exist 'bmll-prod-lakehouse-market/__unitystorage/schemas/f476ced5-fdfb-47c8-8a92-35604c399648/metadata/version-hint.text'. Detail: [errno 2] No such file or directory
+<LazyFrame at 0x7FEA5C93E250>
 ```
