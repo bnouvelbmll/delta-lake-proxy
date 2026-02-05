@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Delta Lake S3 Proxy Specification</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: false });
+    
+    // Wait for DOM to load
+    document.addEventListener("DOMContentLoaded", async () => {
+      // Pandoc outputs: <pre class="mermaid"><code>...</code></pre> with HTML escaped characters (e.g. &gt;)
+      // Mermaid needs unescaped text in a div.
+      
+      const mermaidBlocks = document.querySelectorAll("pre.mermaid");
+      
+      mermaidBlocks.forEach(pre => {
+        const div = document.createElement("div");
+        div.className = "mermaid";
+        // .textContent automatically decodes HTML entities (e.g. &gt; -> >)
+        div.textContent = pre.textContent;
+        pre.replaceWith(div);
+      });
+
+      // Now run mermaid on the new divs
+      await mermaid.run({
+        querySelector: ".mermaid"
+      });
+    });
+  </script>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; }
+    pre { background: #f4f4f4; padding: 10px; border-radius: 5px; }
+    code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+    pre code { padding: 0; }
+    table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Delta Lake S3 Proxy Specification</h1>
+</header>
+<h1 id="client-side-auth-proxy-specification">Client-Side Auth Proxy
+Specification</h1>
+<h2 id="problem-statement">1. Problem Statement</h2>
+<p>When the Delta Lake Proxy is configured in <code>presignedUrl</code>
+mode, it redirects clients (like Spark or custom scripts) to a
+temporary, pre-signed S3 URL using an HTTP 307 Temporary Redirect.</p>
+<p>If the client is configured to use AWS IAM authentication (e.g.,
+attaching an <code>Authorization</code> header signed with AWS
+credentials), it may naively forward this header to the new location
+(the pre-signed S3 URL) when following the redirect.</p>
+<p><strong>The Conflict:</strong> Amazon S3 rejects requests that
+contain <strong>both</strong>: 1. A pre-signed URL signature (in the
+query string). 2. An <code>Authorization</code> header (from the
+client’s original request).</p>
+<p>This results in a <code>400 Bad Request</code> error from S3, causing
+the data retrieval to fail.</p>
+<h2 id="solution-local-python-proxy">2. Solution: Local Python
+Proxy</h2>
+<p>To resolve this without modifying the client’s internal behavior
+(which might be hardcoded or part of a closed library), we introduce a
+lightweight <strong>Client-Side Proxy</strong>.</p>
+<p>This proxy runs locally on the client’s machine (or sidecar) and acts
+as a middleware.</p>
+<h3 id="architecture">2.1 Architecture</h3>
+<pre class="mermaid"><code>graph LR
+    subgraph &quot;Client Side [BMLL DATA LAB]&quot;
+        Client[Spark / Client App]
+        LocalProxy[Local Python Proxy =Redirect Comptatibility=]
+    end
+
+    subgraph &quot;Server Side  AWS US-EAST-1]&quot;
+    DeltaProxy[Delta Lake Proxy =Permissionning Logic=]
+        S3[Amazon S3]
+    end
+
+    Client -- &quot;1. Request + Auth Header&quot; --&gt; LocalProxy
+    LocalProxy -- &quot;2. Forward Request + Auth Header&quot; --&gt; DeltaProxy
+    DeltaProxy -. &quot;3. Generate presigned url&quot; -.- S3
+    DeltaProxy -- &quot;4. 307 Redirect (Presigned URL)&quot; --&gt; LocalProxy  
+    LocalProxy -- &quot;5. Follow Redirect (Manage Headers)&quot; --&gt; S3
+    S3 -- &quot;6. Data Stream&quot; --&gt; LocalProxy
+    LocalProxy -- &quot;7. Data Stream&quot; --&gt; Client
+    </code></pre>
+<h3 id="workflow">2.2 Workflow</h3>
+<ol type="1">
+<li><strong>Client Request</strong>: The client sends a request to the
+<code>Local Python Proxy</code> (e.g.,
+<code>http://localhost:8000/...</code>) instead of the remote
+<code>Delta Lake Proxy</code>. It includes the AWS
+<code>Authorization</code> header.</li>
+<li><strong>Forwarding</strong>: The <code>Local Python Proxy</code>
+forwards the request to the <code>Delta Lake Proxy</code>, preserving
+the <code>Authorization</code> header so the Delta Proxy can
+authenticate the user.</li>
+<li><strong>Redirect Interception</strong>:
+<ul>
+<li>The <code>Delta Lake Proxy</code> returns a
+<code>307 Temporary Redirect</code> pointing to a pre-signed S3
+URL.</li>
+<li>The <code>Local Python Proxy</code> intercepts this response.</li>
+</ul></li>
+<li><strong>Header Stripping &amp; Fetching</strong>:
+<ul>
+<li>The <code>Local Python Proxy</code> follows the redirect to S3.</li>
+<li><strong>Crucially</strong>, it <strong>removes all headers except
+the <code>Range</code> header</strong> (if present) before making the
+request to S3. The pre-signed URL itself provides the necessary
+authorization.</li>
+</ul></li>
+<li><strong>Streaming Response</strong>: The
+<code>Local Python Proxy</code> streams the response body from S3 back
+to the Client.</li>
+</ol>
+<h3 id="implementation-details">2.3 Implementation Details</h3>
+<ul>
+<li><strong>Language</strong>: Python (using <code>requests</code> or
+<code>aiohttp</code>).</li>
+<li><strong>Scope</strong>: Single-host / Local use.</li>
+<li><strong>Logic</strong>:
+<ul>
+<li>Listen on a local port.</li>
+<li>For every incoming request:
+<ul>
+<li>Construct the upstream URL (Delta Proxy).</li>
+<li>Forward the request method, headers, and body.</li>
+<li>Check the response status.</li>
+<li>If <code>307</code> (or
+<code>301</code>/<code>302</code>/<code>303</code>/<code>308</code>) AND
+the location is an S3 URL:
+<ul>
+<li>Make a new request to the redirect location.</li>
+<li><strong>Exclude all headers except <code>Range</code></strong> (if
+present).</li>
+<li>Stream the result back to the client.</li>
+</ul></li>
+<li>Else:
+<ul>
+<li>Stream the response directly back to the client.</li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+<h3 id="sequence-diagram">2.4 Sequence Diagram</h3>
+<pre class="mermaid"><code>sequenceDiagram
+    participant Client
+    participant LocalProxy as Local Python Proxy
+    participant DeltaProxy as Delta Lake Proxy
+    participant S3
+
+    Client-&gt;&gt;LocalProxy: GET /datalake/table/file.parquet (Auth: AWS4-HMAC...)
+    LocalProxy-&gt;&gt;DeltaProxy: GET /datalake/table/file.parquet (Auth: AWS4-HMAC...)
+    DeltaProxy-&gt;&gt;S3: Request Presigned URL
+    S3--&gt;&gt;DeltaProxy: Return Presigned URL
+    DeltaProxy--&gt;&gt;LocalProxy: 307 Redirect (Location: https://s3.../file.parquet?Signature=...)
+    
+    Note over LocalProxy: Intercept 307. Detect S3 Target.
+    
+    LocalProxy-&gt;&gt;S3: GET https://s3.../file.parquet?Signature=...
+    Note right of LocalProxy: Authorization Header REMOVED, Range Header KEPT (if present)
+    
+    S3--&gt;&gt;LocalProxy: 200 OK (File Content)
+    LocalProxy--&gt;&gt;Client: 200 OK (File Content)</code></pre>
+</body>
+</html>
